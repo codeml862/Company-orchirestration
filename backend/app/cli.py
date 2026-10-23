@@ -17,6 +17,7 @@ from sqlalchemy import select
 from app.agents.catalog import sync_catalog
 from app.config import get_settings
 from app.db import session_scope
+from app.governance.retention import purge_expired
 from app.models import User, UserRole
 from app.security import hash_password
 
@@ -43,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("sync-catalog")
     sub.add_parser("bootstrap")
+    sub.add_parser("purge-expired")
     create = sub.add_parser("create-user")
     create.add_argument("email")
     create.add_argument("role", choices=[r.value for r in UserRole])
@@ -64,6 +66,9 @@ def main(argv: list[str] | None = None) -> int:
             _create_user(
                 settings.bootstrap_admin_email, UserRole.ADMIN, settings.bootstrap_admin_password, "Administrator", None
             )
+    if args.command == "purge-expired":
+        with session_scope() as db:
+            print(f"deleted {purge_expired(db)} expired project(s)")
     if args.command == "create-user":
         password = os.environ.get("AICO_NEW_USER_PASSWORD") or getpass.getpass("Password: ")
         if len(password) < 10:

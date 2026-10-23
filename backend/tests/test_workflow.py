@@ -142,6 +142,7 @@ def test_qa_rejection_sends_work_back_with_feedback(make_project, worker, compan
         assert task.status == TaskStatus.APPROVED
         assert task.attempt_count == 2
         assert task.feedback[0]["required_fixes"] == ["Handle negative numbers"]
+        assert task.last_error is None  # the rejection stays in feedback and reviews, not as a current error
         verdicts = [
             r.verdict for r in db.scalars(select(Review).where(Review.task_id == task.id).order_by(Review.created_at))
         ]
@@ -333,3 +334,33 @@ def test_no_provider_means_no_work_is_lost(make_project, settings):
         task = db.scalar(select(Task).where(Task.project_id == project_id))
         assert task.status == TaskStatus.READY
         assert task.attempt_count == 0
+
+
+def test_retention_purges_only_expired_finished_projects(make_project, worker):
+    from app.governance.retention import purge_expired
+    from app.storage import get_storage
+
+    old_id, client_id = make_project(title="Old")
+    submit(old_id)
+    run_until_idle(worker)
+    [delivery] = pending_approvals(old_id, ApprovalKind.FINAL_DELIVERY)
+    approve(delivery.id)
+    fresh_id, _ = make_project(title="Fresh")
+    with session_scope() as db:
+        old = db.get(Project, old_id)
+        old.completed_at = utcnow() - timedelta(days=400)  # default retention is 365 days
+        keys = [a.storage_key for a in db.scalars(select(Artifact).where(Artifact.project_id == old_id))]
+    assert keys
+
+    with session_scope() as db:
+        assert purge_expired(db) == 1
+    with session_scope() as db:
+        assert db.get(Project, old_id) is None
+        assert db.get(Project, fresh_id) is not None
+        assert db.scalar(select(func.count()).select_from(Task).where(Task.project_id == old_id)) == 0
+        assert db.scalar(select(func.count()).select_from(Execution).where(Execution.project_id == old_id)) == 0
+        deletion = db.scalar(select(AuditLog).where(AuditLog.action == "project.deleted"))
+        assert deletion.client_id == client_id and deletion.project_id is None
+    for key in keys:
+        with pytest.raises(FileNotFoundError):
+            get_storage().get(key)

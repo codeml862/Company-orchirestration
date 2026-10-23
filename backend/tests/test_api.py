@@ -227,15 +227,29 @@ def test_project_controls(api, staff):
         json={"title": "Report", "request": "Write a market report on EV chargers.", "client_id": client["id"]},
         headers=staff["operator"],
     ).json()
+    limits = api.patch(
+        f"/api/projects/{project['id']}", json={"budget_usd": "2.5", "priority": 1}, headers=staff["supervisor"]
+    )
+    assert limits.status_code == 200 and float(limits.json()["budget_usd"]) == 2.5 and limits.json()["priority"] == 1
+    assert (
+        api.patch(
+            f"/api/projects/{project['id']}", json={"priority": 1}, headers=_login(api, "acme@client.io")
+        ).status_code
+        == 403
+    )
     assert api.post(f"/api/projects/{project['id']}/pause", headers=staff["operator"]).json()["status"] == "paused"
     assert api.post(f"/api/projects/{project['id']}/pause", headers=staff["operator"]).status_code == 409
     assert (
         api.post(f"/api/projects/{project['id']}/resume", headers=staff["operator"]).json()["status"] == "in_progress"
     )
+    assert api.delete(f"/api/projects/{project['id']}", headers=staff["admin"]).status_code == 409  # still running
     cancelled = api.post(f"/api/projects/{project['id']}/cancel", headers=staff["supervisor"]).json()
     assert cancelled["status"] == "cancelled"
     tasks = api.get(f"/api/projects/{project['id']}/tasks", headers=staff["operator"]).json()
     assert all(t["status"] == "cancelled" for t in tasks)
+    assert api.delete(f"/api/projects/{project['id']}", headers=staff["supervisor"]).status_code == 403
+    assert api.delete(f"/api/projects/{project['id']}", headers=staff["admin"]).status_code == 204
+    assert api.get(f"/api/projects/{project['id']}", headers=staff["admin"]).status_code == 404
 
 
 def test_health(api):

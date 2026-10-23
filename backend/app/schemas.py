@@ -209,6 +209,13 @@ class ProjectSummary(ProjectOut):
     needs_client_input: bool
 
 
+class ProjectUpdate(BaseModel):
+    priority: int | None = Field(default=None, ge=1, le=5)
+    budget_usd: Decimal | None = Field(default=None, ge=0)
+    budget_tokens: int | None = Field(default=None, ge=1000)
+    deadline: datetime | None = None
+
+
 class FeedbackIn(BaseModel):
     score: int = Field(ge=1, le=5)
     comment: str | None = Field(default=None, max_length=5000)

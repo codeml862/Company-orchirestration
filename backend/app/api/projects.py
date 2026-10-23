@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session
 from app import audit
 from app.config import get_settings
 from app.db import get_db
-from app.deps import current_user, get_project_for_user, is_staff, require_staff
+from app.deps import current_user, get_project_for_user, is_staff, require_admin, require_staff
 from app.governance.controls import ControlError, cancel_project, pause_project, resume_project
+from app.governance.retention import RetentionError, delete_project
 from app.models import (
     AgentMessage,
     Approval,
@@ -35,6 +36,7 @@ from app.schemas import (
     MessageOut,
     ProjectCreate,
     ProjectSummary,
+    ProjectUpdate,
     TaskOut,
 )
 from app.storage import read_artifact, save_artifact
@@ -138,6 +140,31 @@ def get_project(project_id: uuid.UUID, db: Session = Depends(get_db), user: User
     return _summary(db, get_project_for_user(db, project_id, user))
 
 
+@router.patch("/projects/{project_id}", response_model=ProjectSummary)
+def update_project(
+    project_id: uuid.UUID, body: ProjectUpdate, db: Session = Depends(get_db), user: User = Depends(require_staff)
+):
+    """Spending limits, priority and deadline. Budget changes take effect at the next model call."""
+    project = get_project_for_user(db, project_id, user)
+    changes = body.model_dump(exclude_unset=True)
+    for field, value in changes.items():
+        setattr(project, field, value)
+    audit.record(
+        db,
+        action="project.updated",
+        entity_type="project",
+        entity_id=project.id,
+        actor_type="user",
+        actor_id=user.id,
+        project_id=project.id,
+        client_id=project.client_id,
+        message=f"Project settings changed: {', '.join(sorted(changes)) or 'nothing'}",
+        details={k: str(v) for k, v in changes.items()},
+    )
+    db.commit()
+    return _summary(db, project)
+
+
 @router.post("/projects/{project_id}/submit", response_model=ProjectSummary)
 def submit(project_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(current_user)):
     project = get_project_for_user(db, project_id, user)
@@ -174,6 +201,18 @@ def resume(project_id: uuid.UUID, db: Session = Depends(get_db), user: User = De
 @router.post("/projects/{project_id}/cancel", response_model=ProjectSummary)
 def cancel(project_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(require_staff)):
     return _control(db, project_id, user, cancel_project)
+
+
+@router.delete("/projects/{project_id}", status_code=204)
+def delete(project_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(require_admin)):
+    """Permanently delete a finished project with all its data and files (e.g. a client's deletion request)."""
+    project = get_project_for_user(db, project_id, user)
+    try:
+        delete_project(db, project, actor_type="user", actor_id=user.id, reason="deleted by administrator")
+    except RetentionError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    db.commit()
+    return Response(status_code=204)
 
 
 @router.post("/projects/{project_id}/feedback", response_model=ProjectSummary)

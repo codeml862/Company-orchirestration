@@ -66,6 +66,8 @@ def transition(
         task.started_at = task.started_at or now
     if new_status in TERMINAL_TASK_STATUSES:
         task.completed_at = now
+    if new_status == S.APPROVED:
+        task.last_error = None  # earlier failures stay in executions, reviews and feedback
     if new_status != S.RUNNING:
         task.lease_owner = None
         task.lease_expires_at = None
