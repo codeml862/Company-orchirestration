@@ -1,0 +1,41 @@
+[project]
+name = "aico-backend"
+version = "0.1.0"
+description = "Autonomous AI Agent Outsourcing Company - backend (API, orchestration engine, workers)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0.30",
+    "psycopg[binary]>=3.2",
+    "alembic>=1.13",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "email-validator>=2.1",
+    "pyjwt>=2.8",
+    "argon2-cffi>=23.1",
+    "httpx>=0.27",
+    "jsonschema>=4.22",
+    "pyyaml>=6.0",
+    "redis>=5.0",
+    "python-multipart>=0.0.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "ruff>=0.5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["B008"]
