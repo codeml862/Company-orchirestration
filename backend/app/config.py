@@ -11,7 +11,6 @@ class Settings(BaseSettings):
 
     env: str = "development"
     database_url: str = "postgresql+psycopg://aico:aico@localhost:5432/aico"
-    redis_url: str = "redis://localhost:6379/0"
 
     # Auth
     jwt_secret: str = Field(default="change-me-in-production", min_length=16)

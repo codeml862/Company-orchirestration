@@ -142,7 +142,9 @@ def test_qa_rejection_sends_work_back_with_feedback(make_project, worker, compan
         assert task.status == TaskStatus.APPROVED
         assert task.attempt_count == 2
         assert task.feedback[0]["required_fixes"] == ["Handle negative numbers"]
-        verdicts = [r.verdict for r in db.scalars(select(Review).where(Review.task_id == task.id).order_by(Review.created_at))]
+        verdicts = [
+            r.verdict for r in db.scalars(select(Review).where(Review.task_id == task.id).order_by(Review.created_at))
+        ]
         assert verdicts == ["rejected", "approved"]
         # Only the accepted attempt's deliverable remains.
         assert db.scalar(select(func.count()).select_from(Artifact).where(Artifact.task_id == task.id)) == 1
@@ -293,7 +295,9 @@ def test_rejected_final_delivery_triggers_revision(make_project, worker):
     run_until_idle(worker)
     with session_scope() as db:
         finals = db.scalars(
-            select(Task).where(Task.project_id == project_id, Task.kind == TaskKind.FINAL_REPORT).order_by(Task.created_at)
+            select(Task)
+            .where(Task.project_id == project_id, Task.kind == TaskKind.FINAL_REPORT)
+            .order_by(Task.created_at)
         ).all()
         assert len(finals) == 2
         assert finals[1].input_data["supervisor_feedback"] == "Add an installation section."

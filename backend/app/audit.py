@@ -1,36 +1,16 @@
-"""Audit trail and live event publishing.
+"""Append-only audit trail.
 
-Every state change is written to `audit_logs` inside the caller's transaction, so the
-audit trail can never disagree with the data. After commit, events are also published to
-Redis so dashboards update live; if Redis is down, clients fall back to polling the table.
+Every state change is written to `audit_logs` inside the caller's transaction, so the audit
+trail can never disagree with the data. The live operations timeline streams this table
+(see app/api/events.py), so whatever the dashboard shows is exactly what was recorded.
 """
 
-import json
-import logging
 import uuid
 from typing import Any
 
-from sqlalchemy import event
 from sqlalchemy.orm import Session
 
-from app.config import get_settings
 from app.models import AuditLog
-
-log = logging.getLogger(__name__)
-
-EVENTS_CHANNEL = "aico:events"
-_PENDING_KEY = "aico_pending_events"
-
-_redis = None
-
-
-def _redis_client():
-    global _redis
-    if _redis is None:
-        import redis
-
-        _redis = redis.Redis.from_url(get_settings().redis_url, socket_timeout=2, socket_connect_timeout=2)
-    return _redis
 
 
 def record(
@@ -60,40 +40,4 @@ def record(
         details=details or {},
     )
     db.add(entry)
-    db.info.setdefault(_PENDING_KEY, []).append(entry)
     return entry
-
-
-def serialize(entry: AuditLog) -> dict:
-    return {
-        "id": entry.id,
-        "actor_type": entry.actor_type,
-        "actor_id": entry.actor_id,
-        "action": entry.action,
-        "entity_type": entry.entity_type,
-        "entity_id": entry.entity_id,
-        "project_id": str(entry.project_id) if entry.project_id else None,
-        "client_id": str(entry.client_id) if entry.client_id else None,
-        "severity": entry.severity,
-        "message": entry.message,
-        "details": entry.details,
-        "created_at": entry.created_at.isoformat() if entry.created_at else None,
-    }
-
-
-@event.listens_for(Session, "after_commit")
-def _publish_after_commit(session: Session) -> None:
-    pending = session.info.pop(_PENDING_KEY, None)
-    if not pending:
-        return
-    try:
-        client = _redis_client()
-        for entry in pending:
-            client.publish(EVENTS_CHANNEL, json.dumps(serialize(entry), default=str))
-    except Exception as exc:  # live push is best-effort; the audit table is the source of truth
-        log.debug("event publish skipped: %s", exc)
-
-
-@event.listens_for(Session, "after_rollback")
-def _discard_after_rollback(session: Session) -> None:
-    session.info.pop(_PENDING_KEY, None)

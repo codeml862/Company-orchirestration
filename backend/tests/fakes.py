@@ -226,7 +226,11 @@ class ScriptedCompany:
     def _consolidate(self, env, messages):
         results = env["context"]["approved_results"]
         return final(
-            {"summary": f"{len(results)} result(s) approved.", "report": json.dumps(results)[:500], "status": "complete"}
+            {
+                "summary": f"{len(results)} result(s) approved.",
+                "report": json.dumps(results)[:500],
+                "status": "complete",
+            }
         )
 
     def _final_report(self, env, messages):

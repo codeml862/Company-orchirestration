@@ -7,7 +7,7 @@ from app.agents.catalog import load_catalog, sync_catalog
 from app.agents.prompts import fence_untrusted
 from app.agents.runner import parse_json_object
 from app.db import session_scope
-from app.models import Agent, Project, Task, TaskKind, TaskStatus
+from app.models import Agent, Project, TaskKind, TaskStatus
 from app.orchestration import registry
 from app.orchestration.state_machine import InvalidTransition, transition
 from app.tools import sandbox, web
@@ -143,8 +143,9 @@ def test_project_files_are_scoped_to_the_project(settings, make_project):
         other_project = _project(db, make_project)
         secret = save_artifact(db, project_id=other_project.id, kind="input", name="secret.txt", data=b"other client")
         ctx = _ctx(db, settings, make_project, "data_analysis")
-        mine = save_artifact(db, project_id=ctx.project.id, kind="input", name="data.csv", data=b"a,b\n1,2\n",
-                             content_type="text/csv")
+        mine = save_artifact(
+            db, project_id=ctx.project.id, kind="input", name="data.csv", data=b"a,b\n1,2\n", content_type="text/csv"
+        )
         listed = execute_tool(ctx, "project_files.list", {})["files"]
         assert [f["name"] for f in listed] == ["data.csv"]
         assert execute_tool(ctx, "project_files.read", {"file_id": str(mine.id)})["untrusted_content"] == "a,b\n1,2\n"
