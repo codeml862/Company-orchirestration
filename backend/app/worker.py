@@ -14,6 +14,7 @@ import time
 from app.agents.runner import AgentRunner
 from app.config import Settings, get_settings
 from app.db import session_scope
+from app.governance import autopilot
 from app.orchestration import registry
 from app.orchestration.engine import process_task
 from app.providers.router import ModelRouter, build_router_from_settings
@@ -33,6 +34,20 @@ class Worker:
         self.stop_event = threading.Event()
         self._last_reap = 0.0
         self._reap_lock = threading.Lock()
+        self._last_autopilot = 0.0
+        self._autopilot_lock = threading.Lock()
+
+    def run_autopilot(self) -> dict[str, int] | None:
+        """Let the autopilot decide pending approvals, at most every autopilot_interval_seconds."""
+        with self._autopilot_lock:
+            if time.monotonic() - self._last_autopilot < self.settings.autopilot_interval_seconds:
+                return None
+            self._last_autopilot = time.monotonic()
+        with session_scope() as db:
+            counts = autopilot.sweep(db, self.settings)
+        if any(counts.values()):
+            log.info("autopilot decided approvals: %s", counts)
+        return counts
 
     def reap(self) -> int:
         with self._reap_lock:
@@ -61,6 +76,7 @@ class Worker:
         while not self.stop_event.is_set():
             try:
                 self.reap()
+                self.run_autopilot()  # needs no LLM: its rules run on recorded data
                 if not self.router.configured:
                     log.error("no LLM provider configured (AICO_LLM_PROVIDERS); not claiming tasks")
                     self.stop_event.wait(LLM_BACKOFF_SECONDS)

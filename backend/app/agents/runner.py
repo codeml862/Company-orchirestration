@@ -314,6 +314,9 @@ class AgentRunner:
                     task=db.get(Task, task_id),
                     agent=db.get(Agent, agent.id),
                 )
+                # End the read transaction before the tool runs: sandbox runs and web fetches can take
+                # minutes, and an open transaction would hold a connection (and SQLite's write lock).
+                db.commit()
                 result = execute_tool(ctx, name, arguments)
             ok = True
         except ToolError as exc:

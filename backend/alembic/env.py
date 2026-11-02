@@ -1,9 +1,10 @@
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, make_url, pool
 
 from app.config import get_settings
+from app.db import ensure_sqlite_dir
 from app.models import Base
 
 config = context.config
@@ -23,6 +24,7 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    ensure_sqlite_dir(make_url(config.get_main_option("sqlalchemy.url")))
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}), prefix="sqlalchemy.", poolclass=pool.NullPool
     )

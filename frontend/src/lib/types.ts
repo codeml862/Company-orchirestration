@@ -10,6 +10,13 @@ export interface User {
   client_id: string | null;
   is_active: boolean;
   created_at: string;
+  last_login_at: string | null;
+}
+
+/** GET /api/auth/providers: what the sign-in and sign-up pages offer. */
+export interface AuthProviders {
+  google_client_id: string | null;
+  signup_enabled: boolean;
 }
 
 export interface Department {
@@ -18,6 +25,49 @@ export interface Department {
   name: string;
   description: string;
   sort_order: number;
+  /** Added from the app (catalog department switched on, or custom); kept by catalog syncs. */
+  added_in_app?: boolean;
+}
+
+/** GET /api/departments/catalog: a catalog department that is not part of the company yet. */
+export interface CatalogDepartment {
+  key: string;
+  name: string;
+  description: string;
+  head: string | null;
+  agent_count: number;
+  roles: Record<string, number>;
+  agents: string[];
+}
+
+/** GET /api/company/agents */
+export interface CompanyAgents {
+  agents: Agent[];
+  departments: { id: string; key: string; name: string; description: string; head: string }[];
+  tools: { name: string; description: string }[];
+}
+
+/** GET /api/departments/overview: a department with its team, live workload and quality metrics. */
+export interface DepartmentOverview {
+  id: string;
+  key: string;
+  name: string;
+  description: string;
+  head: { id: string; name: string; role_type: string } | null;
+  team: { id: string; name: string; role_type: string; status: AgentStats["status"] }[];
+  agents_total: number;
+  agents_active: number;
+  agents_working: number;
+  running_tasks: number;
+  queued_tasks: number;
+  in_review: number;
+  awaiting_approval: number;
+  blocked: number;
+  tasks_completed: number;
+  tasks_failed: number;
+  first_pass_acceptance_rate: number | null;
+  mean_task_completion_seconds: number | null;
+  total_cost_usd: number;
 }
 
 export interface AgentStats {
@@ -61,6 +111,8 @@ export interface Agent {
   customized: boolean;
   version: number;
   updated_at: string;
+  /** Set for an agent a client company created; it only works on that company's projects. */
+  client_id: string | null;
   stats: AgentStats;
 }
 
@@ -72,6 +124,7 @@ export interface OrgNode {
   department: string | null;
   department_name: string | null;
   is_active: boolean;
+  client_id: string | null;
   stats: AgentStats;
   children: OrgNode[];
 }
@@ -210,6 +263,49 @@ export interface TaskDetail extends Task {
   messages: Message[];
 }
 
+export interface Submission {
+  state: "submitted" | "awaiting_release" | "returned" | "not_ready";
+  submitted_at: string | null;
+  released_by: string | null;
+  note: string | null;
+}
+
+export interface SubmissionSummary {
+  project_id: string;
+  title: string;
+  client_name: string;
+  status: string;
+  objective_met: boolean | null;
+  executive_summary: string | null;
+  files: number;
+  tokens_used: number;
+  spent_usd: string;
+  created_at: string;
+  submission: Submission;
+}
+
+export interface Handoff {
+  at: string;
+  type: "assignment" | "result" | "review" | "escalation" | "submission";
+  sender: string;
+  sender_department: string | null;
+  recipient: string;
+  recipient_department: string | null;
+  what: string;
+  summary: string | null;
+  status: string | null;
+  files: string[];
+}
+
+export interface SubmissionDetail extends SubmissionSummary {
+  request: string;
+  objective: string | null;
+  completed_at: string | null;
+  final_report: FinalReport | null;
+  deliverables: { id: string; name: string; path: string; kind: string; size_bytes: number; created_at: string; author: string | null; task_title: string | null }[];
+  handoffs: Handoff[];
+}
+
 export interface Artifact {
   id: string;
   project_id: string;
@@ -312,5 +408,9 @@ export interface Client {
   contact_email: string | null;
   allow_external_llm: boolean;
   data_retention_days: number;
+  /** How much the autopilot decides for this client (backend app/governance/autopilot.py). */
+  autonomy_level: AutonomyLevel;
   created_at: string;
 }
+
+export type AutonomyLevel = "supervised" | "autonomous" | "full";

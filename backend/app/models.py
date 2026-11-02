@@ -10,6 +10,7 @@ from decimal import Decimal
 from enum import StrEnum
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -20,11 +21,48 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    TypeDecorator,
+    Uuid,
+    false,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.config import get_settings
 from app.db import Base
+
+# JSONB on PostgreSQL, plain JSON on SQLite (local development).
+JSONType = JSON().with_variant(JSONB(), "postgresql")
+
+
+class UUIDType(TypeDecorator):
+    """Native UUID on PostgreSQL. Like PostgreSQL, also accepts UUID strings, so SQLite behaves the same."""
+
+    impl = Uuid
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return uuid.UUID(value) if isinstance(value, str) else value
+
+
+class UTCDateTime(TypeDecorator):
+    """Timezone-aware timestamp. SQLite stores no offset, so values are written as UTC and read back as UTC."""
+
+    impl = DateTime
+    cache_ok = True
+
+    def __init__(self) -> None:
+        super().__init__(timezone=True)
+
+    def process_bind_param(self, value, dialect):
+        if value is not None and value.tzinfo is not None and dialect.name == "sqlite":
+            return value.astimezone(UTC).replace(tzinfo=None)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
 
 
 def utcnow() -> datetime:
@@ -113,6 +151,14 @@ class ApprovalStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class AutonomyLevel(StrEnum):
+    """How much of a client's project the autopilot may decide (app/governance/autopilot.py)."""
+
+    SUPERVISED = "supervised"  # every approval waits for a human
+    AUTONOMOUS = "autonomous"  # routine approvals decided by policy; external actions go to a human
+    FULL = "full"  # also approves external actions, spending and hiring; never irreversible ones
+
+
 class ArtifactKind(StrEnum):
     INPUT = "input"  # uploaded by the client
     WORK = "work"  # produced by an agent
@@ -122,27 +168,31 @@ class ArtifactKind(StrEnum):
 class Client(Base):
     __tablename__ = "clients"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_id)
+    id: Mapped[uuid.UUID] = mapped_column(UUIDType(), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(200))
     contact_email: Mapped[str | None] = mapped_column(String(320))
     # When false, this client's data may only be sent to local / private model providers.
     allow_external_llm: Mapped[bool] = mapped_column(Boolean, default=False)
     data_retention_days: Mapped[int] = mapped_column(Integer, default=365)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # New clients start at AICO_DEFAULT_AUTONOMY_LEVEL; rows created before the setting existed are supervised.
+    autonomy_level: Mapped[str] = mapped_column(
+        String(16), default=lambda: get_settings().default_autonomy_level, server_default=AutonomyLevel.SUPERVISED
+    )
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
 
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_id)
+    id: Mapped[uuid.UUID] = mapped_column(UUIDType(), primary_key=True, default=new_id)
     email: Mapped[str] = mapped_column(String(320), unique=True)
     full_name: Mapped[str] = mapped_column(String(200))
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(32))
     client_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    last_login_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
     client: Mapped[Client | None] = relationship()
 
@@ -152,30 +202,35 @@ class User(Base):
 class Department(Base):
     __tablename__ = "departments"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_id)
+    id: Mapped[uuid.UUID] = mapped_column(UUIDType(), primary_key=True, default=new_id)
     key: Mapped[str] = mapped_column(String(64), unique=True)
     name: Mapped[str] = mapped_column(String(200))
     description: Mapped[str] = mapped_column(Text, default="")
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    # Added from the app (a catalog department switched on, or a custom one): catalog sync keeps it
+    # even when AICO_ENABLED_DEPARTMENTS does not list it.
+    added_in_app: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
 
 class Agent(Base):
     __tablename__ = "agents"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_id)
+    id: Mapped[uuid.UUID] = mapped_column(UUIDType(), primary_key=True, default=new_id)
     key: Mapped[str] = mapped_column(String(100), unique=True)  # stable human-readable id
     name: Mapped[str] = mapped_column(String(200))
     department_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("departments.id"))
     role_type: Mapped[str] = mapped_column(String(32))
     reports_to_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agents.id"))
+    # Set for an agent a client company created: it only ever works on that company's projects.
+    client_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"), index=True)
     description: Mapped[str] = mapped_column(Text, default="")
-    responsibilities: Mapped[list] = mapped_column(JSONB, default=list)
+    responsibilities: Mapped[list] = mapped_column(JSONType, default=list)
     system_instructions: Mapped[str] = mapped_column(Text, default="")
-    required_inputs: Mapped[list] = mapped_column(JSONB, default=list)
+    required_inputs: Mapped[list] = mapped_column(JSONType, default=list)
     output_requirements: Mapped[str] = mapped_column(Text, default="")
-    allowed_tools: Mapped[list] = mapped_column(JSONB, default=list)
+    allowed_tools: Mapped[list] = mapped_column(JSONType, default=list)
     # Task kinds this agent may be assigned (e.g. QA agents: ["review"]).
-    task_kinds: Mapped[list] = mapped_column(JSONB, default=list)
+    task_kinds: Mapped[list] = mapped_column(JSONType, default=list)
     model_tier: Mapped[str] = mapped_column(String(32), default="standard")
     model_override: Mapped[str | None] = mapped_column(String(200))  # "provider/model"
     temperature: Mapped[float] = mapped_column(Float, default=0.2)
@@ -183,14 +238,14 @@ class Agent(Base):
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=300)
     max_tokens_per_task: Mapped[int] = mapped_column(Integer, default=60000)
     max_cost_usd_per_task: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("1.0"))
-    quality_criteria: Mapped[list] = mapped_column(JSONB, default=list)
-    escalation_rules: Mapped[list] = mapped_column(JSONB, default=list)
+    quality_criteria: Mapped[list] = mapped_column(JSONType, default=list)
+    escalation_rules: Mapped[list] = mapped_column(JSONType, default=list)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     # True when an operator edited the agent in the UI; catalog sync then leaves it alone.
     customized: Mapped[bool] = mapped_column(Boolean, default=False)
     version: Mapped[int] = mapped_column(Integer, default=1)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow, onupdate=utcnow)
 
     department: Mapped[Department | None] = relationship()
     reports_to: Mapped["Agent | None"] = relationship(remote_side=[id])
@@ -199,28 +254,28 @@ class Agent(Base):
 class Project(Base):
     __tablename__ = "projects"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_id)
+    id: Mapped[uuid.UUID] = mapped_column(UUIDType(), primary_key=True, default=new_id)
     client_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"))
     title: Mapped[str] = mapped_column(String(300))
     request: Mapped[str] = mapped_column(Text)  # the client's original request (untrusted input)
-    requested_deliverables: Mapped[list] = mapped_column(JSONB, default=list)
+    requested_deliverables: Mapped[list] = mapped_column(JSONType, default=list)
     objective: Mapped[str | None] = mapped_column(Text)  # defined by the CEO agent
-    expected_outcomes: Mapped[list] = mapped_column(JSONB, default=list)
+    expected_outcomes: Mapped[list] = mapped_column(JSONType, default=list)
     status: Mapped[str] = mapped_column(String(32), default=ProjectStatus.SUBMITTED)
     priority: Mapped[int] = mapped_column(Integer, default=3)  # 1 = highest
     budget_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     budget_tokens: Mapped[int | None] = mapped_column(Integer)
     spent_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
     tokens_used: Mapped[int] = mapped_column(Integer, default=0)
-    deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    final_report: Mapped[dict | None] = mapped_column(JSONB)
+    deadline: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    final_report: Mapped[dict | None] = mapped_column(JSONType)
     satisfaction_score: Mapped[int | None] = mapped_column(Integer)  # 1..5, given by the client
     satisfaction_comment: Mapped[str | None] = mapped_column(Text)
     created_by_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow, onupdate=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
     client: Mapped[Client] = relationship()
 
@@ -233,7 +288,7 @@ class Project(Base):
 class Task(Base):
     __tablename__ = "tasks"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_id)
+    id: Mapped[uuid.UUID] = mapped_column(UUIDType(), primary_key=True, default=new_id)
     project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
     parent_task_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"))
     kind: Mapped[str] = mapped_column(String(32))
@@ -246,11 +301,11 @@ class Task(Base):
     target_task_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"))
     status: Mapped[str] = mapped_column(String(32), default=TaskStatus.PENDING)
     priority: Mapped[int] = mapped_column(Integer, default=3)
-    input_data: Mapped[dict] = mapped_column(JSONB, default=dict)
-    acceptance_criteria: Mapped[list] = mapped_column(JSONB, default=list)
-    result: Mapped[dict | None] = mapped_column(JSONB)
-    evidence: Mapped[list] = mapped_column(JSONB, default=list)
-    feedback: Mapped[list] = mapped_column(JSONB, default=list)  # QA rejections, for the next attempt
+    input_data: Mapped[dict] = mapped_column(JSONType, default=dict)
+    acceptance_criteria: Mapped[list] = mapped_column(JSONType, default=list)
+    result: Mapped[dict | None] = mapped_column(JSONType)
+    evidence: Mapped[list] = mapped_column(JSONType, default=list)
+    feedback: Mapped[list] = mapped_column(JSONType, default=list)  # QA rejections, for the next attempt
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
     requires_review: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -258,17 +313,17 @@ class Task(Base):
     approval_kind: Mapped[str | None] = mapped_column(String(32))
     approval_granted: Mapped[bool] = mapped_column(Boolean, default=False)
     depth: Mapped[int] = mapped_column(Integer, default=0)  # delegation depth
-    deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline: Mapped[datetime | None] = mapped_column(UTCDateTime())
     lease_owner: Mapped[str | None] = mapped_column(String(200))
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     idempotency_key: Mapped[str] = mapped_column(String(300), unique=True)
     last_error: Mapped[str | None] = mapped_column(Text)
     tokens_used: Mapped[int] = mapped_column(Integer, default=0)
     cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow, onupdate=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
     assigned_agent: Mapped[Agent | None] = relationship(foreign_keys=[assigned_agent_id])
     department: Mapped[Department | None] = relationship()
@@ -297,7 +352,7 @@ class Execution(Base):
 
     __tablename__ = "executions"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_id)
+    id: Mapped[uuid.UUID] = mapped_column(UUIDType(), primary_key=True, default=new_id)
     task_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"))
     agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agents.id"))
     project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
@@ -312,11 +367,11 @@ class Execution(Base):
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
     latency_ms: Mapped[int | None] = mapped_column(Integer)
-    output: Mapped[dict | None] = mapped_column(JSONB)
-    transcript: Mapped[list] = mapped_column(JSONB, default=list)  # LLM/tool steps, truncated
+    output: Mapped[dict | None] = mapped_column(JSONType)
+    transcript: Mapped[list] = mapped_column(JSONType, default=list)  # LLM/tool steps, truncated
     error: Mapped[str | None] = mapped_column(Text)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
     __table_args__ = (
         Index("ix_executions_task", "task_id"),
@@ -328,7 +383,7 @@ class Execution(Base):
 class Review(Base):
     __tablename__ = "reviews"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_id)
+    id: Mapped[uuid.UUID] = mapped_column(UUIDType(), primary_key=True, default=new_id)
     task_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"))
     review_task_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("tasks.id", ondelete="SET NULL"))
     reviewer_agent_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agents.id"))
@@ -336,8 +391,8 @@ class Review(Base):
     verdict: Mapped[str] = mapped_column(String(32))
     score: Mapped[float | None] = mapped_column(Float)
     feedback: Mapped[str] = mapped_column(Text, default="")
-    checks: Mapped[list] = mapped_column(JSONB, default=list)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    checks: Mapped[list] = mapped_column(JSONType, default=list)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
     __table_args__ = (Index("ix_reviews_task", "task_id"),)
 
@@ -347,15 +402,15 @@ class AgentMessage(Base):
 
     __tablename__ = "agent_messages"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_id)
+    id: Mapped[uuid.UUID] = mapped_column(UUIDType(), primary_key=True, default=new_id)
     project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
     task_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"))
     sender_agent_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agents.id"))
     recipient_agent_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agents.id"))
     message_type: Mapped[str] = mapped_column(String(32))  # assignment | result | review | escalation
     objective: Mapped[str] = mapped_column(Text, default="")
-    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    payload: Mapped[dict] = mapped_column(JSONType, default=dict)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
     __table_args__ = (Index("ix_agent_messages_project", "project_id", "created_at"),)
 
@@ -365,18 +420,18 @@ class Approval(Base):
 
     __tablename__ = "approvals"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_id)
+    id: Mapped[uuid.UUID] = mapped_column(UUIDType(), primary_key=True, default=new_id)
     project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
     task_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"))
     kind: Mapped[str] = mapped_column(String(32))
     title: Mapped[str] = mapped_column(String(300))
-    details: Mapped[dict] = mapped_column(JSONB, default=dict)
+    details: Mapped[dict] = mapped_column(JSONType, default=dict)
     requested_by_agent_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agents.id"))
     status: Mapped[str] = mapped_column(String(32), default=ApprovalStatus.PENDING)
     decided_by_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     decision_note: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    decided_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
     __table_args__ = (Index("ix_approvals_status", "status", "created_at"),)
 
@@ -386,7 +441,7 @@ class Artifact(Base):
 
     __tablename__ = "artifacts"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_id)
+    id: Mapped[uuid.UUID] = mapped_column(UUIDType(), primary_key=True, default=new_id)
     project_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
     task_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("tasks.id", ondelete="SET NULL"))
     agent_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("agents.id"))
@@ -396,7 +451,7 @@ class Artifact(Base):
     storage_key: Mapped[str] = mapped_column(String(500))
     size_bytes: Mapped[int] = mapped_column(Integer, default=0)
     sha256: Mapped[str] = mapped_column(String(64))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
     __table_args__ = (Index("ix_artifacts_project", "project_id", "kind"),)
 
@@ -416,8 +471,8 @@ class AuditLog(Base):
     client_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"))
     severity: Mapped[str] = mapped_column(String(16), default="info")  # info | warning | error
     message: Mapped[str] = mapped_column(Text, default="")
-    details: Mapped[dict] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    details: Mapped[dict] = mapped_column(JSONType, default=dict)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
 
     __table_args__ = (
         Index("ix_audit_logs_project", "project_id", "id"),

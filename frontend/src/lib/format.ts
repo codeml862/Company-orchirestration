@@ -50,7 +50,7 @@ export function humanize(value: string): string {
     .join(" ");
 }
 
-type Tone = "gray" | "blue" | "green" | "amber" | "red" | "violet";
+export type Tone = "gray" | "blue" | "green" | "amber" | "red" | "violet";
 
 const STATUS_TONES: Record<string, Tone> = {
   pending: "gray",

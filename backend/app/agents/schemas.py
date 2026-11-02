@@ -97,7 +97,8 @@ EXECUTE = {
                 "type": "object",
                 "required": ["name", "content"],
                 "properties": {
-                    "name": {"type": "string", "pattern": "^[^/\\\\]{1,120}$"},
+                    # A relative path (src/app.py) that places the file in the project's structure.
+                    "name": {"type": "string", "pattern": "^[^/\\\\][^\\\\]{0,199}$"},
                     "content_type": {"type": "string"},
                     "content": {"type": "string"},
                 },

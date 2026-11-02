@@ -7,6 +7,8 @@ os.environ["AICO_SANDBOX_BACKEND"] = "subprocess"
 os.environ["AICO_STORAGE_DIR"] = tempfile.mkdtemp(prefix="aico-test-storage-")
 os.environ["AICO_JWT_SECRET"] = "test-secret-test-secret-test-secret"
 os.environ["AICO_LLM_PROVIDERS"] = "[]"
+os.environ["AICO_ENABLED_DEPARTMENTS"] = ""  # tests use the whole catalog, whatever backend/.env says
+os.environ["AICO_DEFAULT_AUTONOMY_LEVEL"] = "autonomous"
 
 import pytest  # noqa: E402
 from sqlalchemy import text  # noqa: E402
@@ -24,8 +26,14 @@ def database():
     from alembic.config import Config
 
     engine = app_db.get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as conn:
+            for table in reversed(Base.metadata.sorted_tables):
+                conn.execute(text(f"DROP TABLE IF EXISTS {table.name}"))
+            conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
+    else:
+        with engine.begin() as conn:
+            conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
     cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
     cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "..", "alembic"))
     cfg.set_main_option("sqlalchemy.url", os.environ["AICO_DATABASE_URL"])
@@ -35,9 +43,13 @@ def database():
 
 @pytest.fixture(autouse=True)
 def clean(database):
-    tables = ", ".join(t.name for t in reversed(Base.metadata.sorted_tables))
     with database.begin() as conn:
-        conn.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
+        if database.dialect.name == "sqlite":
+            for table in reversed(Base.metadata.sorted_tables):
+                conn.execute(text(f"DELETE FROM {table.name}"))
+        else:
+            tables = ", ".join(t.name for t in reversed(Base.metadata.sorted_tables))
+            conn.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
     with app_db.session_scope() as session:
         sync_catalog(session)
     yield

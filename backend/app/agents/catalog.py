@@ -3,6 +3,12 @@
 The YAML catalog is the source of truth for the default organization. Sync is idempotent:
 it creates missing departments and agents and updates catalog-managed agents. Agents an
 operator has edited in the UI (`customized = True`) keep their edits.
+
+`AICO_ENABLED_DEPARTMENTS` limits the company to some departments. Departments left out are
+removed with their agents; an agent that already has work history (or was customized) is only
+deactivated, so nothing that references it breaks. Enabling the department again restores it.
+Departments added in the app (`added_in_app`: a catalog department switched on, or a custom one)
+are always kept.
 """
 
 from dataclasses import dataclass, field
@@ -14,8 +20,32 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import audit
-from app.models import Agent, AgentRole, Department, TaskKind
+from app.config import get_settings
+from app.models import (
+    Agent,
+    AgentMessage,
+    AgentRole,
+    Approval,
+    Artifact,
+    Department,
+    Execution,
+    Review,
+    Task,
+    TaskKind,
+)
 from app.tools.registry import TOOLS
+
+# Every column that records an agent's work; an agent referenced here is never deleted.
+AGENT_HISTORY = (
+    Task.assigned_agent_id,
+    Task.created_by_agent_id,
+    Execution.agent_id,
+    Review.reviewer_agent_id,
+    AgentMessage.sender_agent_id,
+    AgentMessage.recipient_agent_id,
+    Approval.requested_by_agent_id,
+    Artifact.agent_id,
+)
 
 CATALOG_PATH = Path(__file__).parent / "catalog" / "company.yaml"
 
@@ -160,9 +190,69 @@ def _validate(dept_keys: set[str], specs: list[AgentSpec]) -> None:
             raise CatalogError(f"no agent can perform {kind} tasks")
 
 
+def enabled_subset(
+    departments: list[dict], specs: list[AgentSpec], extra: set[str] = frozenset()
+) -> tuple[list[dict], list[AgentSpec]]:
+    """The catalog restricted to AICO_ENABLED_DEPARTMENTS plus `extra` (departments switched on in the app),
+    checked to still be a working company."""
+    wanted = {k.strip() for k in get_settings().enabled_departments.split(",") if k.strip()}
+    if not wanted:
+        return departments, specs
+    catalog_keys = {d["key"] for d in departments}
+    unknown = wanted - catalog_keys
+    if unknown:
+        raise CatalogError(f"AICO_ENABLED_DEPARTMENTS names unknown departments: {sorted(unknown)}")
+    wanted |= set(extra) & catalog_keys
+    specs = [s for s in specs if s.department in wanted]
+    try:
+        _validate(wanted, specs)
+    except CatalogError as exc:
+        raise CatalogError(
+            f"AICO_ENABLED_DEPARTMENTS={','.join(sorted(wanted))} is not a working company ({exc}). "
+            "The workflow needs 'executive' (CEO) and 'operations' (planning and QA) plus a delivery department."
+        ) from exc
+    return [d for d in departments if d["key"] in wanted], specs
+
+
+def _has_history(db: Session, agent: Agent) -> bool:
+    return any(db.scalar(select(column).where(column == agent.id).limit(1)) for column in AGENT_HISTORY)
+
+
+def _retire_departments(db: Session, keep: set[str], stats: dict) -> None:
+    """Remove departments outside `keep`, with their agents; agents with history or edits are deactivated."""
+    for dept in db.scalars(select(Department).where(Department.key.not_in(keep))):
+        agents = list(db.scalars(select(Agent).where(Agent.department_id == dept.id)))
+        kept = [a for a in agents if a.customized or _has_history(db, a)]
+        removed = [a for a in agents if a not in kept]
+        removed_ids = {a.id for a in removed}
+        for agent in db.scalars(select(Agent).where(Agent.reports_to_id.in_(removed_ids))):
+            agent.reports_to_id = None
+        db.flush()
+        for agent in removed:
+            db.delete(agent)
+        for agent in kept:
+            agent.is_active = False
+        stats["agents_removed"] += len(removed)
+        stats["agents_deactivated"] += len(kept)
+        db.flush()
+        if not kept and db.scalar(select(Task.id).where(Task.department_id == dept.id).limit(1)) is None:
+            db.delete(dept)
+            stats["departments_removed"] += 1
+    db.flush()
+
+
 def sync_catalog(db: Session, path: Path = CATALOG_PATH) -> dict:
-    departments, specs = load_catalog(path)
-    stats = {"departments_created": 0, "agents_created": 0, "agents_updated": 0, "agents_skipped": 0}
+    added_in_app = set(db.scalars(select(Department.key).where(Department.added_in_app)))
+    departments, specs = enabled_subset(*load_catalog(path), extra=added_in_app)
+    stats = {
+        "departments_created": 0,
+        "agents_created": 0,
+        "agents_updated": 0,
+        "agents_skipped": 0,
+        "departments_removed": 0,
+        "agents_removed": 0,
+        "agents_deactivated": 0,
+    }
 
     dept_by_key: dict[str, Department] = {d.key: d for d in db.scalars(select(Department))}
     for order, d in enumerate(departments):
@@ -190,6 +280,9 @@ def sync_catalog(db: Session, path: Path = CATALOG_PATH) -> dict:
             continue
         else:
             stats["agents_updated"] += 1
+        # A catalog-managed agent is only ever inactive because its department was disabled
+        # (deactivating in the UI marks it customized), so a synced agent is active again.
+        agent.is_active = True
         agent.name = s.name
         agent.department_id = dept_by_key[s.department].id
         agent.role_type = s.role_type
@@ -216,5 +309,6 @@ def sync_catalog(db: Session, path: Path = CATALOG_PATH) -> dict:
         agent.reports_to_id = agent_by_key[s.reports_to].id if s.reports_to else None
     db.flush()
 
+    _retire_departments(db, {d["key"] for d in departments} | added_in_app, stats)
     audit.record(db, action="catalog.synced", entity_type="catalog", message="Agent catalog synced", details=stats)
     return stats

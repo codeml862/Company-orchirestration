@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     Agent,
+    AgentRole,
     Approval,
     ApprovalKind,
     ApprovalStatus,
@@ -37,6 +38,13 @@ def _ratio(numerator, denominator) -> float | None:
     return round(numerator / denominator, 4) if denominator else None
 
 
+def _seconds_between(db: Session, start, end):
+    """SQL expression for `end - start` in seconds, on PostgreSQL or SQLite."""
+    if db.get_bind().dialect.name == "sqlite":
+        return (func.julianday(end) - func.julianday(start)) * 86400
+    return func.extract("epoch", end - start)
+
+
 def quality_metrics(db: Session, department_id: uuid.UUID | None = None, client_id: uuid.UUID | None = None) -> dict:
     """Section 11 metrics over specialist work (EXECUTE tasks)."""
     task_filter = [Task.kind == TaskKind.EXECUTE]
@@ -52,7 +60,7 @@ def quality_metrics(db: Session, department_id: uuid.UUID | None = None, client_
         or 0
     )
     avg_seconds = db.scalar(
-        select(func.avg(func.extract("epoch", Task.completed_at - Task.started_at))).where(
+        select(func.avg(_seconds_between(db, Task.started_at, Task.completed_at))).where(
             *task_filter, Task.status == TaskStatus.APPROVED
         )
     )
@@ -208,6 +216,53 @@ def with_status(agent: Agent, stats: dict | None) -> dict:
     s = {**defaults, **s}
     s["status"] = "inactive" if not agent.is_active else ("working" if s["running_tasks"] else "idle")
     return s
+
+
+def department_overview(db: Session) -> list[dict]:
+    """Every department with its head, team, live workload and quality metrics (the departments page)."""
+    agents = list(db.scalars(select(Agent).order_by(Agent.name)))
+    stats = agent_stats(db)
+    workload: dict = {}
+    for department_id, status, count in db.execute(
+        select(Task.department_id, Task.status, func.count())
+        .where(Task.department_id.is_not(None))
+        .group_by(Task.department_id, Task.status)
+    ):
+        workload.setdefault(department_id, {})[status] = count
+    rank = {role: i for i, role in enumerate(AgentRole)}
+
+    overview = []
+    for dept in db.scalars(select(Department).order_by(Department.sort_order)):
+        team = [(a, with_status(a, stats.get(a.id))) for a in agents if a.department_id == dept.id]
+        head = min((a for a, _ in team), key=lambda a: (rank.get(a.role_type, len(rank)), a.name), default=None)
+        counts = workload.get(dept.id, {})
+        quality = quality_metrics(db, department_id=dept.id)
+        overview.append(
+            {
+                "id": str(dept.id),
+                "key": dept.key,
+                "name": dept.name,
+                "description": dept.description,
+                "head": {"id": str(head.id), "name": head.name, "role_type": head.role_type} if head else None,
+                "team": [
+                    {"id": str(a.id), "name": a.name, "role_type": a.role_type, "status": s["status"]} for a, s in team
+                ],
+                "agents_total": len(team),
+                "agents_active": sum(1 for a, _ in team if a.is_active),
+                "agents_working": sum(1 for _, s in team if s["status"] == "working"),
+                "running_tasks": counts.get(TaskStatus.RUNNING, 0),
+                "queued_tasks": counts.get(TaskStatus.READY, 0) + counts.get(TaskStatus.PENDING, 0),
+                "in_review": counts.get(TaskStatus.IN_REVIEW, 0),
+                "awaiting_approval": counts.get(TaskStatus.AWAITING_APPROVAL, 0),
+                "blocked": counts.get(TaskStatus.BLOCKED, 0),
+                "tasks_completed": quality["tasks_completed"],
+                "tasks_failed": quality["tasks_failed"],
+                "first_pass_acceptance_rate": quality["first_pass_acceptance_rate"],
+                "mean_task_completion_seconds": quality["mean_task_completion_seconds"],
+                "total_cost_usd": quality["total_cost_usd"],
+            }
+        )
+    return overview
 
 
 def executive_dashboard(db: Session) -> dict:

@@ -15,6 +15,8 @@ Configuration (AICO_LLM_PROVIDERS, JSON list), for example:
 import json
 import logging
 
+from dotenv import load_dotenv
+
 from app.config import get_settings
 from app.providers.base import (
     CompletionRequest,
@@ -65,6 +67,8 @@ class ModelRouter:
 
 
 def build_router_from_settings() -> ModelRouter:
+    # Settings read .env without exporting it; api_key_env names (GROQ_API_KEY) may live there too.
+    load_dotenv(".env", override=False)
     raw = get_settings().llm_providers.strip() or "[]"
     configs = json.loads(raw)
     providers: list[LLMProvider] = [OpenAICompatibleProvider(**cfg) for cfg in configs]

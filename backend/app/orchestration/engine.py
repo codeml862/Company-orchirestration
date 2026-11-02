@@ -54,6 +54,7 @@ from app.orchestration.protocol import (
 from app.orchestration.registry import ACTIVE_PROJECT_STATUSES
 from app.orchestration.state_machine import transition
 from app.storage import get_storage, save_artifact
+from app.workspace import refresh_workspace
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +70,9 @@ class EngineError(Exception):
 
 def agent_for_kind(db: Session, kind: TaskKind, prefer_key: str | None = None) -> Agent:
     agents = [
-        a for a in db.scalars(select(Agent).where(Agent.is_active).order_by(Agent.key)) if kind in (a.task_kinds or [])
+        a
+        for a in db.scalars(select(Agent).where(Agent.is_active, Agent.client_id.is_(None)).order_by(Agent.key))
+        if kind in (a.task_kinds or [])
     ]
     if not agents:
         raise EngineError(f"no active agent can perform {kind} tasks")
@@ -85,6 +88,7 @@ def department_head(db: Session, department_key: str) -> Agent | None:
         .where(
             Department.key == department_key,
             Agent.is_active,
+            Agent.client_id.is_(None),
             Agent.role_type.in_([AgentRole.DIRECTOR, AgentRole.COORDINATOR]),
             Agent.reports_to_id == (ceo.id if ceo else None),
         )
@@ -211,7 +215,7 @@ def build_semantic_check(db: Session, task: Task, settings: Settings) -> Semanti
 
     if kind == TaskKind.ALLOCATE:
         coordinator = db.get(Agent, task.assigned_agent_id)
-        team = {a.key: a.role_type for a in assignable_team(db, coordinator)} if coordinator else {}
+        team = {a.key: a.role_type for a in assignable_team(db, coordinator, task.project_id)} if coordinator else {}
         reviewer_keys = {a.key for a in reviewers(db)}
         level = int(task.input_data.get("delegation_level", 1))
 
@@ -270,7 +274,17 @@ def build_semantic_check(db: Session, task: Task, settings: Settings) -> Semanti
 
 
 def process_task(task_id: uuid.UUID, worker_id: str, runner: AgentRunner, settings: Settings) -> str:
-    """Run a claimed task end to end. Returns a short status for the worker loop."""
+    """Run a claimed task end to end, then refresh the project's readable folder. Returns a short status."""
+    status = _process_task(task_id, worker_id, runner, settings)
+    if status != "skipped":
+        with session_scope() as db:
+            project_id = db.scalar(select(Task.project_id).where(Task.id == task_id))
+        if project_id:
+            refresh_workspace(project_id)
+    return status
+
+
+def _process_task(task_id: uuid.UUID, worker_id: str, runner: AgentRunner, settings: Settings) -> str:
     # Phase 1: prepare (short transaction).
     with session_scope() as db:
         task = db.get(Task, task_id, with_for_update=True)
@@ -544,7 +558,7 @@ def _complete_allocate(db: Session, task: Task, output: dict, tools: list[dict])
         for dep in dependency_tasks(db, task)
         if dep.status == TaskStatus.APPROVED
     ]
-    agents = {a.key: a for a in assignable_team(db, coordinator)}
+    agents = {a.key: a for a in assignable_team(db, coordinator, task.project_id)}
     ends: dict[str, Task] = {}
     for a in topological_order(output["assignments"]):
         member = agents.get(a["agent_key"])

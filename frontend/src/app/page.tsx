@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useEffect } from "react";
 
-import { Spinner } from "@/components/ui";
+import { LoadingScreen } from "@/components/shared/Loading";
 import { homeFor, useAuth } from "@/lib/auth";
 
 export default function Home() {
@@ -13,5 +13,5 @@ export default function Home() {
     if (loading) return;
     router.replace(user ? homeFor(user.role) : "/login");
   }, [user, loading, router]);
-  return <Spinner />;
+  return <LoadingScreen label="Getting things ready…" />;
 }

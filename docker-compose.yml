@@ -1,0 +1,75 @@
+# Local stack: Postgres, API, worker and web app.
+#
+#   docker compose up --build        # everything
+#   docker compose up -d db          # only Postgres, when running the backend and frontend natively
+#
+# Backend settings come from backend/.env (copy backend/.env.example) when it exists.
+
+x-backend: &backend
+  build: ./backend
+  env_file:
+    - path: ./backend/.env
+      required: false
+  environment:
+    AICO_DATABASE_URL: postgresql+psycopg://aico:aico@db:5432/aico
+    AICO_STORAGE_DIR: /app/data/storage
+    # The docker sandbox cannot run from inside a container, so the compose stack uses the subprocess
+    # sandbox (fine for development, refused when AICO_ENV=production).
+    AICO_SANDBOX_BACKEND: ${AICO_SANDBOX_BACKEND:-subprocess}
+  volumes:
+    - storage:/app/data
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aico
+      POSTGRES_PASSWORD: aico
+      POSTGRES_DB: aico
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aico -d aico"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    <<: *backend
+    command: sh -c "alembic upgrade head && python -m app.cli bootstrap && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  worker:
+    <<: *backend
+    command: python -m app.worker
+    depends_on:
+      api:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  storage:

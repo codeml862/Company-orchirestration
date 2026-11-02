@@ -10,11 +10,11 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import String, cast, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.models import Agent, Artifact, ArtifactKind, Project, Task, TaskStatus
+from app.models import Agent, Artifact, ArtifactKind, Project, Task, TaskKind, TaskStatus
 from app.storage import is_text, read_artifact
 from app.tools import sandbox, web
 
@@ -110,9 +110,31 @@ def _fetch(ctx: ToolContext, args: dict) -> dict:
         raise ToolError(str(exc)) from exc
 
 
+def _knowledge_rows_sqlite(ctx: ToolContext, query: str) -> list:
+    """SQLite (local development) has no PostgreSQL full-text search: match every word, newest first."""
+    words = query.split()[:10]
+    if not words:
+        return []
+    haystack = Task.title + " " + func.coalesce(cast(Task.result, String), "")
+    return ctx.db.execute(
+        select(Task.id, Task.title, Project.title.label("project_title"), Task.result)
+        .join(Project, Project.id == Task.project_id)
+        .where(
+            Project.client_id == ctx.project.client_id,
+            Task.status == TaskStatus.APPROVED,
+            Task.kind.in_([TaskKind.EXECUTE, TaskKind.CONSOLIDATE, TaskKind.FINAL_REPORT]),
+            *[haystack.icontains(word, autoescape=True) for word in words],
+        )
+        .order_by(Task.completed_at.desc())
+        .limit(5)
+    ).all()
+
+
 def _knowledge_search(ctx: ToolContext, args: dict) -> dict:
     """Full-text search over approved work of the same client (current and past projects)."""
     query = str(args["query"])[:500]
+    if ctx.db.get_bind().dialect.name == "sqlite":
+        return _knowledge_results(query, _knowledge_rows_sqlite(ctx, query))
     rows = ctx.db.execute(
         text(
             """
@@ -131,6 +153,10 @@ def _knowledge_search(ctx: ToolContext, args: dict) -> dict:
         ),
         {"q": query, "client_id": ctx.project.client_id},
     ).all()
+    return _knowledge_results(query, rows)
+
+
+def _knowledge_results(query: str, rows) -> dict:
     results = []
     for row in rows:
         result = row.result or {}
@@ -210,7 +236,17 @@ TOOLS: dict[str, Tool] = {
 }
 
 
+def resolve_tool_name(name: str) -> str:
+    """Map a wrong namespace onto the one tool with that action (gpt-oss says repo_browser.run_python)."""
+    if name in TOOLS:
+        return name
+    action = name.rsplit(".", 1)[-1]
+    matches = [n for n in TOOLS if n.rsplit(".", 1)[-1] == action]
+    return matches[0] if len(matches) == 1 else name
+
+
 def execute_tool(ctx: ToolContext, name: str, arguments: dict) -> dict:
+    name = resolve_tool_name(name)
     if name not in TOOLS:
         raise ToolError(f"unknown tool {name!r}")
     if name not in (ctx.agent.allowed_tools or []):

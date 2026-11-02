@@ -4,8 +4,9 @@ Backends:
 * docker (default, required for production): throwaway container with no network,
   read-only root filesystem, memory/CPU/PID limits, non-root user, and only the task's files.
 * subprocess (development only): isolated interpreter in a temp dir with an empty
-  environment (no secrets) and CPU/memory/file-size rlimits. It is NOT a security boundary
-  against hostile code; the platform refuses to use it when AICO_ENV=production.
+  environment (no secrets) and CPU/memory/file-size rlimits (on Windows: a Job Object with a
+  memory and process cap, killed when the run ends). It is NOT a security boundary against
+  hostile code; the platform refuses to use it when AICO_ENV=production.
 """
 
 import os
@@ -45,8 +46,8 @@ def _prepare_workdir(code: str, files: dict[str, str]) -> Path:
     for name, content in files.items():
         target = workdir / _safe_relative(name)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
-    (workdir / "main.py").write_text(code)
+        target.write_text(content, encoding="utf-8")
+    (workdir / "main.py").write_text(code, encoding="utf-8")
     os.chmod(workdir, 0o777)
     for p in workdir.rglob("*"):
         os.chmod(p, 0o777 if p.is_dir() else 0o666)
@@ -134,7 +135,86 @@ def _limit_resources(memory_mb: int, cpu_seconds: int):
     return apply
 
 
+def _windows_job(memory_mb: int):
+    """A Job Object that caps the process's memory and kills it when the handle is closed."""
+    import ctypes
+    from ctypes import wintypes
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulonglong) for n in ("r", "w", "o", "rb", "wb", "ob")]
+
+    class BASIC_LIMITS(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class EXTENDED_LIMITS(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BASIC_LIMITS),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    job = kernel32.CreateJobObjectW(None, None)
+    limits = EXTENDED_LIMITS()
+    # JOB_OBJECT_LIMIT_ACTIVE_PROCESS | PROCESS_MEMORY | KILL_ON_JOB_CLOSE
+    limits.BasicLimitInformation.LimitFlags = 0x8 | 0x100 | 0x2000
+    limits.BasicLimitInformation.ActiveProcessLimit = 32
+    limits.ProcessMemoryLimit = memory_mb * 1024 * 1024
+    kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits))  # ExtendedLimitInformation
+    return kernel32, job
+
+
+def _run_subprocess_windows(workdir: Path, settings: Settings, timeout: int) -> dict:
+    # SYSTEMROOT is required for Python to start on Windows; nothing else from the host environment.
+    env = {
+        "SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
+        "PATH": str(Path(sys.executable).parent),
+        "TEMP": str(workdir),
+        "TMP": str(workdir),
+        "USERPROFILE": str(workdir),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+    }
+    kernel32, job = _windows_job(max(settings.sandbox_memory_mb, 256))
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-E", "-s", "-X", "utf8", "main.py"],  # -E ignores PYTHONUTF8, hence -X
+            cwd=workdir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        kernel32.AssignProcessToJobObject(job, int(proc._handle))
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            return _completed(out, err, -1, True)
+        return _completed(out, err, proc.returncode, False)
+    finally:
+        kernel32.CloseHandle(job)  # kills anything the code left running
+
+
 def _run_subprocess(workdir: Path, settings: Settings, timeout: int) -> dict:
+    if sys.platform == "win32":
+        return _run_subprocess_windows(workdir, settings, timeout)
     env = {"PATH": "/usr/bin:/bin", "HOME": str(workdir), "PYTHONDONTWRITEBYTECODE": "1", "LANG": "C.UTF-8"}
     try:
         proc = subprocess.run(

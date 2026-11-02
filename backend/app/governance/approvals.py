@@ -26,6 +26,7 @@ from app.models import (
 )
 from app.orchestration import registry
 from app.orchestration.state_machine import transition
+from app.workspace import refresh_after_commit
 
 
 class ApprovalError(Exception):
@@ -67,9 +68,19 @@ def request_approval(
     return approval
 
 
-def decide(db: Session, approval: Approval, *, user_id, approve: bool, note: str | None = None) -> Approval:
+def decide(
+    db: Session,
+    approval: Approval,
+    *,
+    user_id,
+    approve: bool,
+    note: str | None = None,
+    actor_type: str = "user",
+) -> Approval:
+    """Apply a decision. The autopilot calls this too, with user_id=None and actor_type="system"."""
     if approval.status != ApprovalStatus.PENDING:
         raise ApprovalError(f"approval is already {approval.status}")
+    refresh_after_commit(db, approval.project_id)
     approval.status = ApprovalStatus.APPROVED if approve else ApprovalStatus.REJECTED
     approval.decided_by_id = user_id
     approval.decision_note = note
@@ -77,7 +88,7 @@ def decide(db: Session, approval: Approval, *, user_id, approve: bool, note: str
     task = db.get(Task, approval.task_id, with_for_update=True) if approval.task_id else None
     project = db.get(Project, approval.project_id)
     waiting = task is not None and task.status == TaskStatus.AWAITING_APPROVAL
-    actor = {"actor_type": "user", "actor_id": user_id}
+    actor = {"actor_type": actor_type, "actor_id": user_id}
 
     if approval.kind == ApprovalKind.CLARIFICATION:
         answer = (note or "").strip() if approve else ""
