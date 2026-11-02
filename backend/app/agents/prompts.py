@@ -19,7 +19,9 @@ COMPANY_POLICIES = """\
    changing production systems). Propose them in `proposed_external_actions`; a human decides.
 5. Use only the tools listed for you. Never request or output credentials, secrets or personal data beyond what the
    task requires.
-6. If the task is ambiguous in a way that would change the result, ask for clarification instead of guessing."""
+6. If the task is ambiguous in a way that would change the result, ask for clarification instead of guessing.
+   Never ask how to split, staff or organise the work: that is your own decision. Only ask about what the
+   client wants that you cannot reasonably assume."""
 
 RESPONSE_PROTOCOL = """\
 Reply with exactly ONE JSON object and nothing else. It must be one of:
@@ -52,6 +54,8 @@ KIND_GUIDANCE: dict[str, str] = {
     ),
     TaskKind.EXECUTE: (
         "Do the assigned work and return complete deliverables (full file contents or documents, not outlines). "
+        "Name code deliverables with relative paths that form the project's file structure "
+        "(e.g. src/app.py, tests/test_app.py, README.md). "
         "Verify your work with your tools where possible (e.g. run tests with sandbox.run_python) and cite the "
         "tool_call_id in evidence. Never state that tests pass unless a recorded sandbox run shows it. Fill "
         "self_assessment with one entry per acceptance criterion. If previous attempts were rejected, address "
@@ -86,7 +90,7 @@ def build_system_prompt(agent: dict, kind: str, tools: list[dict], max_tasks: in
     tool_text = json.dumps(tools, indent=1) if tools else "none - you have no tools for this task"
     parts = [
         f"You are the {agent['name']} ({agent['role_type'].replace('_', ' ')}, {agent['department']} department) "
-        "at AICO, an outsourcing company staffed by AI agents and supervised by humans.",
+        "at Orchestria, an outsourcing company staffed by AI agents and supervised by humans.",
         f"## Your role\n{agent['description']}\nResponsibilities:\n{_bullets(agent['responsibilities'])}",
     ]
     if agent["instructions"]:

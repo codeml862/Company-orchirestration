@@ -8,7 +8,7 @@ a need-to-know basis: an agent only receives what its task needs.
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.agents.schemas import OUTPUT_SCHEMAS
@@ -67,19 +67,30 @@ def _untrusted(content: str) -> dict:
 
 
 def _department_keys(db: Session) -> list[dict]:
+    """Departments that can take work: those with at least one active agent."""
+    staffed = select(Agent.department_id).where(
+        Agent.is_active, Agent.client_id.is_(None), Agent.department_id.is_not(None)
+    )
     return [
         {"key": d.key, "name": d.name, "description": d.description}
-        for d in db.scalars(select(Department).order_by(Department.sort_order))
+        for d in db.scalars(select(Department).where(Department.id.in_(staffed)).order_by(Department.sort_order))
     ]
 
 
-def assignable_team(db: Session, coordinator: Agent) -> list[Agent]:
+def assignable_team(db: Session, coordinator: Agent, project_id) -> list[Agent]:
     """Agents a coordinator may assign to: active direct reports that execute work or coordinate a team.
 
-    Members of a sub-coordinator's team are reached by delegating to that sub-coordinator.
+    Members of a sub-coordinator's team are reached by delegating to that sub-coordinator. An agent a
+    client company created only ever works on that company's projects.
     """
+    client_id = db.scalar(select(Project.client_id).where(Project.id == project_id))
+    members = select(Agent).where(
+        Agent.reports_to_id == coordinator.id,
+        Agent.is_active,
+        or_(Agent.client_id.is_(None), Agent.client_id == client_id),
+    )
     team = []
-    for member in db.scalars(select(Agent).where(Agent.reports_to_id == coordinator.id, Agent.is_active)):
+    for member in db.scalars(members):
         kinds = set(member.task_kinds or [])
         if TaskKind.EXECUTE in kinds or (
             member.role_type in (AgentRole.SUB_COORDINATOR, AgentRole.COORDINATOR, AgentRole.DIRECTOR)
@@ -90,7 +101,9 @@ def assignable_team(db: Session, coordinator: Agent) -> list[Agent]:
 
 
 def reviewers(db: Session) -> list[Agent]:
-    return [a for a in db.scalars(select(Agent).where(Agent.is_active)) if TaskKind.REVIEW in (a.task_kinds or [])]
+    """QA reviewers: the company's own, never an agent a client created (reviews must be independent)."""
+    active = select(Agent).where(Agent.is_active, Agent.client_id.is_(None))
+    return [a for a in db.scalars(active) if TaskKind.REVIEW in (a.task_kinds or [])]
 
 
 def _artifact_content(artifact: Artifact) -> str:
@@ -195,7 +208,7 @@ def build_envelope(db: Session, task: Task) -> dict:
                 "description": a.description,
                 "tools": a.allowed_tools,
             }
-            for a in assignable_team(db, recipient)
+            for a in assignable_team(db, recipient, task.project_id)
         ]
         context["reviewers"] = [
             {"agent_key": a.key, "name": a.name, "description": a.description} for a in reviewers(db)

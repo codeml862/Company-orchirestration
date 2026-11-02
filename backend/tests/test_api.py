@@ -1,8 +1,11 @@
 """API tests: authentication, role-based access, tenant isolation and the client journey."""
 
+import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api import auth as auth_api
+from app.config import get_settings
 from app.db import session_scope
 from app.main import create_app
 from app.models import User, UserRole
@@ -252,6 +255,151 @@ def test_project_controls(api, staff):
     assert api.get(f"/api/projects/{project['id']}", headers=staff["admin"]).status_code == 404
 
 
+def test_admin_manages_clients_and_users(api, staff):
+    client = api.post("/api/clients", json={"name": "Acme"}, headers=staff["operator"]).json()
+    updated = api.patch(
+        f"/api/clients/{client['id']}",
+        json={"allow_external_llm": True, "data_retention_days": 30, "contact_email": "ops@acme.test"},
+        headers=staff["operator"],
+    )
+    assert updated.status_code == 200
+    assert updated.json()["allow_external_llm"] is True and updated.json()["data_retention_days"] == 30
+    invalid = api.patch(f"/api/clients/{client['id']}", json={"data_retention_days": 0}, headers=staff["admin"])
+    assert invalid.status_code == 422
+
+    new_user = {"email": "pat@acme.test", "full_name": "Pat", "password": PASSWORD, "role": "client"}
+    with_client = {**new_user, "client_id": client["id"]}
+    assert api.post("/api/users", json=new_user, headers=staff["admin"]).status_code == 422  # needs a client
+    created = api.post("/api/users", json=with_client, headers=staff["admin"])
+    assert created.status_code == 201
+    assert api.post("/api/users", json=with_client, headers=staff["admin"]).status_code == 409
+    assert api.post("/api/users", json=with_client, headers=staff["supervisor"]).status_code == 403
+    pat = created.json()
+    pat_headers = _login(api, "pat@acme.test")
+
+    promoted = api.patch(f"/api/users/{pat['id']}", json={"role": "operator"}, headers=staff["admin"]).json()
+    assert promoted["role"] == "operator" and promoted["client_id"] is None
+    demoted = api.patch(f"/api/users/{pat['id']}", json={"role": "client"}, headers=staff["admin"])
+    assert demoted.status_code == 422  # needs a client again
+
+    assert api.patch(f"/api/users/{pat['id']}", json={"is_active": False}, headers=staff["admin"]).status_code == 200
+    assert api.get("/api/auth/me", headers=pat_headers).status_code == 401
+    assert api.post("/api/auth/login", json={"email": "pat@acme.test", "password": PASSWORD}).status_code == 401
+
+    admin_id = api.get("/api/auth/me", headers=staff["admin"]).json()["id"]
+    assert api.patch(f"/api/users/{admin_id}", json={"is_active": False}, headers=staff["admin"]).status_code == 422
+    assert api.patch(f"/api/users/{admin_id}", json={"role": "operator"}, headers=staff["admin"]).status_code == 422
+    users = api.get("/api/users", headers=staff["admin"]).json()
+    assert {u["email"] for u in users} >= {"admin@test.io", "pat@acme.test"}
+    assert all("last_login_at" in u for u in users)
+
+
+def test_google_sign_in_only_for_existing_users(api, staff, monkeypatch):
+    assert api.get("/api/auth/providers").json() == {"google_client_id": None, "signup_enabled": True}
+    assert api.post("/api/auth/google", json={"credential": "x" * 40}).status_code == 404  # not enabled
+
+    monkeypatch.setattr(get_settings(), "google_client_id", "client-123.apps.googleusercontent.com")
+    claims = {"email": "Admin@Test.io", "email_verified": True}
+    seen = []
+
+    def fake_verify(token, client_id):
+        seen.append(client_id)
+        return dict(claims)
+
+    monkeypatch.setattr(auth_api, "verify_google_id_token", fake_verify)
+    assert api.get("/api/auth/providers").json()["google_client_id"] == "client-123.apps.googleusercontent.com"
+
+    signed_in = api.post("/api/auth/google", json={"credential": "x" * 40})
+    assert signed_in.status_code == 200 and signed_in.json()["user"]["email"] == "admin@test.io"
+    assert seen == ["client-123.apps.googleusercontent.com"]
+    headers = {"Authorization": f"Bearer {signed_in.json()['access_token']}"}
+    assert api.get("/api/auth/me", headers=headers).json()["role"] == "admin"
+
+    claims["email"] = "stranger@gmail.com"
+    assert api.post("/api/auth/google", json={"credential": "x" * 40}).status_code == 403  # no account
+    claims.update(email="admin@test.io", email_verified=False)
+    assert api.post("/api/auth/google", json={"credential": "x" * 40}).status_code == 401
+
+    def invalid(token, client_id):
+        raise jwt.InvalidAudienceError("token was issued for another app")
+
+    monkeypatch.setattr(auth_api, "verify_google_id_token", invalid)
+    assert api.post("/api/auth/google", json={"credential": "x" * 40}).status_code == 401
+
+
+def test_self_signup_creates_a_client_company(api, staff, monkeypatch):
+    body = {"company_name": " Initech ", "full_name": "Peter", "email": "Peter@Initech.test", "password": PASSWORD}
+    created = api.post("/api/auth/signup", json=body)
+    assert created.status_code == 201, created.text
+    user = created.json()["user"]
+    assert user["role"] == "client" and user["email"] == "peter@initech.test" and user["client_id"]
+    headers = {"Authorization": f"Bearer {created.json()['access_token']}"}
+    assert api.get("/api/projects", headers=headers).json() == []
+    assert api.get("/api/agents", headers=headers).status_code == 403  # never staff
+
+    [client] = [c for c in api.get("/api/clients", headers=staff["operator"]).json() if c["id"] == user["client_id"]]
+    assert client["name"] == "Initech" and client["allow_external_llm"] is False
+
+    assert api.post("/api/auth/signup", json=body).status_code == 409
+    short_password = {**body, "email": "a@initech.test", "password": "short"}
+    blank_company = {**body, "email": "b@initech.test", "company_name": "  "}
+    for invalid in (short_password, blank_company):
+        assert api.post("/api/auth/signup", json=invalid).status_code == 422
+
+    monkeypatch.setattr(get_settings(), "google_client_id", "client-123.apps.googleusercontent.com")
+    claims = {"email": "Milton@Initech.test", "email_verified": True, "name": "Milton"}
+    monkeypatch.setattr(auth_api, "verify_google_id_token", lambda token, client_id: dict(claims))
+    google = api.post("/api/auth/google/signup", json={"credential": "x" * 40, "company_name": "Initech Labs"})
+    assert google.status_code == 201, google.text
+    assert google.json()["user"]["full_name"] == "Milton" and google.json()["user"]["email"] == "milton@initech.test"
+    assert api.post("/api/auth/google", json={"credential": "x" * 40}).status_code == 200  # can sign in again
+    again = api.post("/api/auth/google/signup", json={"credential": "x" * 40, "company_name": "Initech Labs"})
+    assert again.status_code == 409
+
+    monkeypatch.setattr(get_settings(), "allow_signup", False)
+    assert api.get("/api/auth/providers").json()["signup_enabled"] is False
+    assert api.post("/api/auth/signup", json={**body, "email": "c@initech.test"}).status_code == 403
+
+
 def test_health(api):
     body = api.get("/api/health").json()
     assert body["status"] == "ok" and body["llm_providers_configured"] == 0
+
+
+def test_only_supervisors_change_client_autonomy(api, staff):
+    created = api.post("/api/clients", json={"name": "Umbrella"}, headers=staff["operator"])
+    assert created.status_code == 201 and created.json()["autonomy_level"] == "autonomous"  # server default
+    url = f"/api/clients/{created.json()['id']}"
+    assert api.patch(url, json={"autonomy_level": "full"}, headers=staff["operator"]).status_code == 403
+    assert api.patch(url, json={"name": "Umbrella Ltd"}, headers=staff["operator"]).status_code == 200
+    changed = api.patch(url, json={"autonomy_level": "full"}, headers=staff["supervisor"])
+    assert changed.status_code == 200 and changed.json()["autonomy_level"] == "full"
+    denied = api.post("/api/clients", json={"name": "X", "autonomy_level": "full"}, headers=staff["operator"])
+    assert denied.status_code == 403
+    assert api.patch(url, json={"autonomy_level": "reckless"}, headers=staff["admin"]).status_code == 422
+
+
+def test_users_manage_their_own_profile_and_password(api, staff):
+    me = staff["operator"]
+    renamed = api.patch("/api/auth/me", json={"full_name": "  Olivia Ops  "}, headers=me)
+    assert renamed.json()["full_name"] == "Olivia Ops"
+    assert api.patch("/api/auth/me", json={"full_name": "   "}, headers=me).status_code == 422
+    change = {"current_password": "not-my-password", "new_password": "a-brand-new-password"}
+    assert api.post("/api/auth/me/password", json=change, headers=me).status_code == 400
+    change["current_password"] = PASSWORD
+    assert api.post("/api/auth/me/password", json=change, headers=me).status_code == 204
+    assert api.post("/api/auth/login", json={"email": "operator@test.io", "password": PASSWORD}).status_code == 401
+    login = api.post("/api/auth/login", json={"email": "operator@test.io", "password": "a-brand-new-password"})
+    assert login.status_code == 200
+
+
+def test_env_owned_admin_changes_its_password_in_env(api, staff):
+    settings = get_settings()
+    original = settings.bootstrap_admin_email
+    settings.bootstrap_admin_email = "admin@test.io"
+    try:
+        change = {"current_password": PASSWORD, "new_password": "a-brand-new-password"}
+        refused = api.post("/api/auth/me/password", json=change, headers=staff["admin"])
+        assert refused.status_code == 409 and "backend/.env" in refused.text
+    finally:
+        settings.bootstrap_admin_email = original

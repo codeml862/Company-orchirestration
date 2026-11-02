@@ -4,6 +4,8 @@ python -m app.cli sync-catalog                 # load/refresh departments and ag
 python -m app.cli create-user EMAIL ROLE [--client-id ID] [--name NAME]
     # password is read from AICO_NEW_USER_PASSWORD, or prompted for
 python -m app.cli bootstrap                    # sync catalog + create the first admin if none exists
+python -m app.cli autopilot                    # decide pending approvals once (workers do it continuously)
+python -m app.cli export-workspace [PROJECT_ID]  # rewrite readable project folders (data/workspaces)
 """
 
 import argparse
@@ -15,11 +17,14 @@ import uuid
 from sqlalchemy import select
 
 from app.agents.catalog import sync_catalog
+from app.bootstrap import BootstrapError, sync_bootstrap_admin
 from app.config import get_settings
 from app.db import session_scope
+from app.governance import autopilot
 from app.governance.retention import purge_expired
-from app.models import User, UserRole
+from app.models import Project, User, UserRole
 from app.security import hash_password
+from app.workspace import export_workspace
 
 
 def _create_user(email: str, role: str, password: str, name: str, client_id: str | None) -> None:
@@ -45,6 +50,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("sync-catalog")
     sub.add_parser("bootstrap")
     sub.add_parser("purge-expired")
+    sub.add_parser("autopilot")
+    export = sub.add_parser("export-workspace")
+    export.add_argument("project_id", nargs="?", help="default: every project")
     create = sub.add_parser("create-user")
     create.add_argument("email")
     create.add_argument("role", choices=[r.value for r in UserRole])
@@ -56,19 +64,24 @@ def main(argv: list[str] | None = None) -> int:
         with session_scope() as db:
             print("catalog:", sync_catalog(db))
     if args.command == "bootstrap":
-        settings = get_settings()
-        with session_scope() as db:
-            has_admin = db.scalar(select(User).where(User.role == UserRole.ADMIN))
-        if not has_admin:
-            if settings.env == "production" and settings.bootstrap_admin_password == "admin-change-me":
-                print("refusing to create the default admin password in production; set AICO_BOOTSTRAP_ADMIN_PASSWORD")
-                return 1
-            _create_user(
-                settings.bootstrap_admin_email, UserRole.ADMIN, settings.bootstrap_admin_password, "Administrator", None
-            )
+        try:
+            with session_scope() as db:
+                changes = sync_bootstrap_admin(db, get_settings())
+        except BootstrapError as exc:
+            print(exc)
+            return 1
+        print("admin:", ", ".join(changes) or "up to date")
     if args.command == "purge-expired":
         with session_scope() as db:
             print(f"deleted {purge_expired(db)} expired project(s)")
+    if args.command == "autopilot":
+        with session_scope() as db:
+            print("autopilot:", autopilot.sweep(db))
+    if args.command == "export-workspace":
+        with session_scope() as db:
+            ids = [uuid.UUID(args.project_id)] if args.project_id else db.scalars(select(Project.id)).all()
+            for project_id in ids:
+                print("exported:", export_workspace(db, project_id) or f"{project_id} not found")
     if args.command == "create-user":
         password = os.environ.get("AICO_NEW_USER_PASSWORD") or getpass.getpass("Password: ")
         if len(password) < 10:

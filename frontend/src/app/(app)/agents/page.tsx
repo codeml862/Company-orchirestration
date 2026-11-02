@@ -1,97 +1,325 @@
 "use client";
 
+import { Activity, Bot, Building2, Coins, Plus, UserRoundSearch, Users, Wrench } from "lucide-react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
+import { toast } from "sonner";
 
-import { Badge, Card, ErrorBanner, PageHeader, Spinner, StatusBadge, Table, Td, inputClass } from "@/components/ui";
+import { AddDepartmentDialog } from "@/components/agents/AddDepartmentDialog";
+import { type AgentPreset, CreateAgentDialog } from "@/components/agents/CreateAgentDialog";
+import { AgentAvatar } from "@/components/shared/AgentAvatar";
+import { DepartmentIcon } from "@/components/shared/DepartmentIcon";
+import { EmptyState } from "@/components/shared/EmptyState";
+import { PageHeader } from "@/components/shared/PageHeader";
+import { SearchInput, matches } from "@/components/shared/SearchInput";
+import { StatCard } from "@/components/shared/StatCard";
+import { StatusBadge, ToneBadge } from "@/components/shared/StatusBadge";
+import { PageError, SyncStatus } from "@/components/shared/SyncStatus";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useAuth } from "@/lib/auth";
 import { formatNumber, formatPercent, formatUsd, humanize } from "@/lib/format";
 import { useApi } from "@/lib/hooks";
-import type { Agent, Department } from "@/lib/types";
+import type { Agent, Client, Department } from "@/lib/types";
+
+const ROLES = ["ceo", "director", "coordinator", "sub_coordinator", "specialist"];
+const STATUSES = ["all", "working", "idle", "inactive"] as const;
+type StatusFilter = (typeof STATUSES)[number];
+
+function AgentCard({ agent, clientName }: { agent: Agent; clientName?: string }) {
+  const s = agent.stats;
+  return (
+    <Link href={`/agents/${agent.id}`} className="group block focus-visible:outline-none">
+      <Card className="h-full gap-0 p-4 transition group-hover:shadow-md group-hover:ring-primary/30 group-focus-visible:ring-2 group-focus-visible:ring-ring">
+        <div className="flex items-start gap-3">
+          <AgentAvatar name={agent.name} role={agent.role_type} status={s.status} />
+          <div className="min-w-0 flex-1">
+            <div className="truncate font-medium group-hover:text-primary">{agent.name}</div>
+            <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+              <span className="text-xs text-muted-foreground">{humanize(agent.role_type)}</span>
+              {clientName && <ToneBadge tone="blue">{clientName}</ToneBadge>}
+              {agent.customized && !clientName && <ToneBadge tone="amber">Custom</ToneBadge>}
+            </div>
+          </div>
+          <StatusBadge status={s.status} />
+        </div>
+        <p className="mt-3 line-clamp-2 min-h-10 text-sm text-muted-foreground">{agent.description || "No description."}</p>
+        <div className="mt-3 grid grid-cols-3 gap-2 border-t pt-3 text-center text-xs">
+          <div>
+            <div className="font-semibold tabular-nums">
+              {s.succeeded}/{s.executions}
+            </div>
+            <div className="text-muted-foreground">runs ok</div>
+          </div>
+          <div>
+            <div className="font-semibold tabular-nums">{formatPercent(s.reviews ? s.first_pass_approvals / s.reviews : null)}</div>
+            <div className="text-muted-foreground">1st-pass QA</div>
+          </div>
+          <div>
+            <div className="font-semibold tabular-nums">{formatNumber(s.tokens)}</div>
+            <div className="text-muted-foreground">tokens</div>
+          </div>
+        </div>
+        <div className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Wrench className="size-3" />
+          {agent.allowed_tools.length ? `${agent.allowed_tools.length} tool${agent.allowed_tools.length === 1 ? "" : "s"}` : "No tools"}
+          <span className="ml-auto">{humanize(agent.model_override ?? agent.model_tier)}</span>
+        </div>
+      </Card>
+    </Link>
+  );
+}
 
 export default function AgentsPage() {
-  const { data: agents, error } = useApi<Agent[]>("/api/agents", 10000);
-  const { data: departments } = useApi<Department[]>("/api/departments");
-  const [department, setDepartment] = useState("");
-  const [role, setRole] = useState("");
-  const [status, setStatus] = useState("");
-  const [search, setSearch] = useState("");
+  const router = useRouter();
+  const { user } = useAuth();
+  const admin = user?.role === "admin";
+  const { data: agents, error, errorStatus, refreshing, updatedAt, reload } = useApi<Agent[]>("/api/agents", 10000);
+  const { data: departments, reload: reloadDepartments } = useApi<Department[]>("/api/departments");
+  const { data: clients } = useApi<Client[]>("/api/clients");
+  const [query, setQuery] = useState("");
+  const [department, setDepartment] = useState("all");
+  const [role, setRole] = useState("all");
+  const [owner, setOwner] = useState("all");
+  const [status, setStatus] = useState<StatusFilter>("all");
+  const [creating, setCreating] = useState(false);
+  const [preset, setPreset] = useState<AgentPreset | undefined>(undefined);
+  const [addingDepartment, setAddingDepartment] = useState(false);
 
-  const deptName = useMemo(() => new Map(departments?.map((d) => [d.id, d.name]) ?? []), [departments]);
+  const clientName = useMemo(() => new Map((clients ?? []).map((c) => [c.id, c.name])), [clients]);
   const filtered = (agents ?? []).filter(
     (a) =>
-      (!department || a.department_id === department) &&
-      (!role || a.role_type === role) &&
-      (!status || a.stats.status === status) &&
-      (!search || `${a.name} ${a.key} ${a.description}`.toLowerCase().includes(search.toLowerCase())),
+      (department === "all" || a.department_id === department) &&
+      (role === "all" || a.role_type === role) &&
+      (status === "all" || a.stats.status === status) &&
+      (owner === "all" || (owner === "client" ? Boolean(a.client_id) : !a.client_id)) &&
+      matches(query, a.name, a.key, a.description, a.client_id ? clientName.get(a.client_id) : null),
+  );
+  const groups = (departments ?? [])
+    .map((d) => ({ department: d, agents: filtered.filter((a) => a.department_id === d.id) }))
+    .filter((g) => g.agents.length > 0);
+  const filtering = Boolean(query) || department !== "all" || role !== "all" || owner !== "all" || status !== "all";
+  const clearFilters = () => {
+    setQuery("");
+    setDepartment("all");
+    setRole("all");
+    setOwner("all");
+    setStatus("all");
+  };
+
+  const header = (
+    <PageHeader
+      title="Agents"
+      subtitle="Every agent in the company: its role, tools, model and how well it performs."
+      actions={
+        <>
+          <SyncStatus updatedAt={updatedAt} refreshing={refreshing} error={agents ? error : null} onRefresh={reload} />
+          {admin && (
+            <>
+              <Button size="sm" variant="outline" onClick={() => setAddingDepartment(true)}>
+                <Building2 /> Add department
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => {
+                  setPreset(department !== "all" ? { department: departments?.find((d) => d.id === department)?.key } : undefined);
+                  setCreating(true);
+                }}
+              >
+                <Plus /> Create agent
+              </Button>
+            </>
+          )}
+        </>
+      }
+    />
   );
 
-  if (!agents) return error ? <ErrorBanner message={error} /> : <Spinner />;
+  if (!agents) {
+    return (
+      <>
+        {header}
+        {error ? (
+          <PageError message={error} status={errorStatus} onRetry={reload} />
+        ) : (
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {Array.from({ length: 6 }, (_, i) => (
+              <Skeleton key={i} className="h-52 rounded-xl" />
+            ))}
+          </div>
+        )}
+      </>
+    );
+  }
+
+  const working = agents.filter((a) => a.stats.status === "working").length;
+  const clientBuilt = agents.filter((a) => a.client_id).length;
+
   return (
     <>
-      <PageHeader title="Agent Management" subtitle="Configure agents, tools, models and limits; inspect logs and performance." />
-      <Card padded={false}>
-        <div className="flex flex-wrap gap-3 border-b border-slate-100 p-4">
-          <input className={`${inputClass} max-w-xs`} placeholder="Search agents…" value={search} onChange={(e) => setSearch(e.target.value)} />
-          <select className={`${inputClass} max-w-[14rem]`} value={department} onChange={(e) => setDepartment(e.target.value)}>
-            <option value="">All departments</option>
-            {departments?.map((d) => (
-              <option key={d.id} value={d.id}>
-                {d.name}
-              </option>
-            ))}
-          </select>
-          <select className={`${inputClass} max-w-[12rem]`} value={role} onChange={(e) => setRole(e.target.value)}>
-            <option value="">All roles</option>
-            {["ceo", "director", "coordinator", "sub_coordinator", "specialist"].map((r) => (
-              <option key={r} value={r}>
-                {humanize(r)}
-              </option>
-            ))}
-          </select>
-          <select className={`${inputClass} max-w-[10rem]`} value={status} onChange={(e) => setStatus(e.target.value)}>
-            <option value="">Any status</option>
-            {["working", "idle", "inactive"].map((s) => (
-              <option key={s} value={s}>
-                {humanize(s)}
-              </option>
-            ))}
-          </select>
-          <div className="ml-auto self-center text-sm text-slate-500">{filtered.length} agents</div>
+      {header}
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <StatCard
+          label="Agents"
+          value={`${agents.filter((a) => a.is_active).length} / ${agents.length}`}
+          hint="active / total"
+          icon={<Bot />}
+        />
+        <StatCard label="Working now" value={working} hint="running a task" tone="violet" icon={<Activity />} />
+        <StatCard
+          label="Built by clients"
+          value={clientBuilt}
+          hint="private to their company"
+          tone="blue"
+          icon={<Users />}
+        />
+        <StatCard
+          label="Spend to date"
+          value={formatUsd(agents.reduce((sum, a) => sum + a.stats.cost_usd, 0))}
+          hint={`${formatNumber(agents.reduce((sum, a) => sum + a.stats.tokens, 0))} tokens`}
+          tone="green"
+          icon={<Coins />}
+        />
+      </div>
+
+      <Card className="mt-6 gap-3 p-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <SearchInput value={query} onChange={setQuery} placeholder="Search agents…" className="w-full sm:w-64" />
+          <Select value={department} onValueChange={setDepartment}>
+            <SelectTrigger className="w-44" aria-label="Filter by department">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All departments</SelectItem>
+              {departments?.map((d) => (
+                <SelectItem key={d.id} value={d.id}>
+                  {d.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={role} onValueChange={setRole}>
+            <SelectTrigger className="w-40" aria-label="Filter by role">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All roles</SelectItem>
+              {ROLES.map((r) => (
+                <SelectItem key={r} value={r}>
+                  {humanize(r)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={owner} onValueChange={setOwner}>
+            <SelectTrigger className="w-40" aria-label="Filter by owner">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All owners</SelectItem>
+              <SelectItem value="company">Company agents</SelectItem>
+              <SelectItem value="client">Client-built</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
-        <Table head={["Agent", "Department", "Role", "Status", "Tools", "Executions", "1st-pass QA", "Tokens", "Cost"]}>
-          {filtered.map((a) => (
-            <tr key={a.id} className="hover:bg-slate-50">
-              <Td>
-                <Link href={`/agents/${a.id}`} className="font-medium text-slate-900 hover:text-brand-700">
-                  {a.name}
-                </Link>
-                <div className="text-xs text-slate-500">{a.key}{a.customized && " · customized"}</div>
-              </Td>
-              <Td>{a.department_id ? deptName.get(a.department_id) : "—"}</Td>
-              <Td>{humanize(a.role_type)}</Td>
-              <Td>
-                <StatusBadge status={a.stats.status} />
-              </Td>
-              <Td>
-                <div className="flex max-w-[16rem] flex-wrap gap-1">
-                  {a.allowed_tools.map((t) => (
-                    <Badge key={t}>{t}</Badge>
-                  ))}
-                </div>
-              </Td>
-              <Td className="tabular-nums">
-                {a.stats.succeeded}/{a.stats.executions}
-                {a.stats.failed > 0 && <span className="text-rose-600"> ({a.stats.failed} failed)</span>}
-              </Td>
-              <Td className="tabular-nums">
-                {a.stats.reviews ? formatPercent(a.stats.first_pass_approvals / Math.max(1, a.stats.reviews)) : "—"}
-              </Td>
-              <Td className="tabular-nums">{formatNumber(a.stats.tokens)}</Td>
-              <Td className="tabular-nums">{formatUsd(a.stats.cost_usd)}</Td>
-            </tr>
-          ))}
-        </Table>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <Tabs value={status} onValueChange={(v) => setStatus(v as StatusFilter)}>
+            <TabsList>
+              {STATUSES.map((s) => (
+                <TabsTrigger key={s} value={s} className="px-2.5">
+                  {humanize(s)}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
+          <span className="text-sm text-muted-foreground">
+            {filtered.length} of {agents.length} agents
+            {filtering && (
+              <Button variant="link" size="sm" className="ml-2 h-auto p-0" onClick={clearFilters}>
+                Clear filters
+              </Button>
+            )}
+          </span>
+        </div>
       </Card>
+
+      {groups.length === 0 ? (
+        <Card className="mt-6">
+          <EmptyState
+            title="No agents match these filters"
+            icon={<UserRoundSearch className="size-5" />}
+            hint={
+              <Button variant="link" className="h-auto p-0" onClick={clearFilters}>
+                Clear filters
+              </Button>
+            }
+          />
+        </Card>
+      ) : (
+        <div className="mt-6 space-y-8">
+          {groups.map(({ department: d, agents: team }) => (
+            <section key={d.id}>
+              <div className="mb-3 flex items-center gap-3">
+                <DepartmentIcon department={d.key} className="size-8 rounded-lg [&_svg]:size-4" />
+                <h2 className="font-semibold">{d.name}</h2>
+                <span className="text-sm text-muted-foreground">{team.length}</span>
+                {admin && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="ml-auto"
+                    onClick={() => {
+                      setPreset({ department: d.key });
+                      setCreating(true);
+                    }}
+                  >
+                    <Plus /> Add agent
+                  </Button>
+                )}
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                {team.map((a) => (
+                  <AgentCard key={a.id} agent={a} clientName={a.client_id ? clientName.get(a.client_id) ?? "Client" : undefined} />
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+      )}
+
+      {admin && departments && (
+        <>
+          <CreateAgentDialog
+            open={creating}
+            onOpenChange={setCreating}
+            agents={agents}
+            departments={departments}
+            preset={preset}
+            onCreated={(agent) => {
+              toast.success(`${agent.name} joined the company`, {
+                action: { label: "Open", onClick: () => router.push(`/agents/${agent.id}`) },
+              });
+              void reload();
+            }}
+          />
+          <AddDepartmentDialog
+            open={addingDepartment}
+            onOpenChange={setAddingDepartment}
+            onAdded={(dept, kind) => {
+              void reloadDepartments();
+              void reload();
+              if (kind === "custom") {
+                setPreset({ department: dept.key, role: "coordinator", reportsTo: "ceo" });
+                setCreating(true);
+              }
+            }}
+          />
+        </>
+      )}
     </>
   );
 }

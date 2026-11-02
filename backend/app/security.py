@@ -1,4 +1,4 @@
-"""Password hashing and JWT access tokens."""
+"""Password hashing, JWT access tokens and Google ID token verification."""
 
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -10,6 +10,10 @@ from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from app.config import get_settings
 
 _hasher = PasswordHasher()
+
+GOOGLE_CERTS_URL = "https://www.googleapis.com/oauth2/v3/certs"
+GOOGLE_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
+_google_keys = jwt.PyJWKClient(GOOGLE_CERTS_URL, lifespan=3600, timeout=10)
 
 
 def hash_password(password: str) -> str:
@@ -38,3 +42,20 @@ def create_access_token(user_id: uuid.UUID, role: str) -> str:
 def decode_access_token(token: str) -> dict:
     settings = get_settings()
     return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+
+
+def verify_google_id_token(token: str, client_id: str) -> dict:
+    """Verify a Google Identity Services ID token (signature, audience, issuer, expiry) and return its claims.
+
+    Raises jwt.PyJWTError when the token is invalid, and jwt.PyJWKClientConnectionError when
+    Google's signing keys cannot be fetched.
+    """
+    signing_key = _google_keys.get_signing_key_from_jwt(token)
+    return jwt.decode(
+        token,
+        signing_key.key,
+        algorithms=["RS256"],
+        audience=client_id,
+        issuer=GOOGLE_ISSUERS,
+        options={"require": ["exp", "iat", "iss", "aud", "sub"]},
+    )

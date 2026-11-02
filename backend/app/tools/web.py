@@ -17,7 +17,7 @@ MAX_BYTES = 2_000_000
 MAX_TEXT_CHARS = 20000
 MAX_REDIRECTS = 4
 TIMEOUT = 15.0
-USER_AGENT = "AICO-ResearchAgent/0.1 (+https://github.com/codeml862/Company-orchirestration)"
+USER_AGENT = "Orchestria-ResearchAgent/0.1 (+https://github.com/codeml862/Company-orchirestration)"
 
 
 class FetchError(Exception):

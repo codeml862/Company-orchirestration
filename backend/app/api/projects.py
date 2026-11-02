@@ -360,7 +360,7 @@ def download(artifact_id: uuid.UUID, db: Session = Depends(get_db), user: User =
     project = get_project_for_user(db, artifact.project_id, user)
     if not is_staff(user) and db.scalar(_client_visible(db, project).where(Artifact.id == artifact.id)) is None:
         raise HTTPException(404, "file not found")
-    safe_name = artifact.name.replace('"', "").replace("\n", "")
+    safe_name = artifact.name.rsplit("/", 1)[-1].replace('"', "").replace("\n", "")
     return Response(
         content=read_artifact(artifact),
         # Always served as a download so user-supplied HTML/SVG can never run in the app's origin.

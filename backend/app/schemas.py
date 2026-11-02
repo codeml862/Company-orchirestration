@@ -21,6 +21,32 @@ class LoginRequest(BaseModel):
     password: str = Field(max_length=200)
 
 
+class GoogleLoginRequest(BaseModel):
+    credential: str = Field(min_length=20, max_length=8000)  # ID token from Google Identity Services
+
+
+def _not_blank(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("must not be blank")
+    return value
+
+
+class SignupRequest(BaseModel):
+    company_name: str = Field(min_length=1, max_length=200)
+    full_name: str = Field(min_length=1, max_length=200)
+    email: EmailStr
+    password: str = Field(min_length=10, max_length=200)
+
+    _strip = field_validator("company_name", "full_name")(_not_blank)
+
+
+class GoogleSignupRequest(GoogleLoginRequest):
+    company_name: str = Field(min_length=1, max_length=200)
+
+    _strip = field_validator("company_name")(_not_blank)
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -35,6 +61,7 @@ class UserOut(ORM):
     client_id: uuid.UUID | None
     is_active: bool
     created_at: datetime
+    last_login_at: datetime | None = None
 
 
 class UserCreate(BaseModel):
@@ -45,11 +72,42 @@ class UserCreate(BaseModel):
     client_id: uuid.UUID | None = None
 
 
+class UserUpdate(BaseModel):
+    full_name: str | None = Field(default=None, min_length=1, max_length=200)
+    role: UserRole | None = None
+    client_id: uuid.UUID | None = None
+    is_active: bool | None = None
+    password: str | None = Field(default=None, min_length=10, max_length=200)
+
+
+AUTONOMY_PATTERN = "^(supervised|autonomous|full)$"
+
+
+class ProfileUpdate(BaseModel):
+    full_name: str = Field(min_length=1, max_length=200)
+
+    _strip = field_validator("full_name")(_not_blank)
+
+
+class PasswordChange(BaseModel):
+    current_password: str = Field(max_length=200)
+    new_password: str = Field(min_length=10, max_length=200)
+
+
 class ClientCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     contact_email: EmailStr | None = None
     allow_external_llm: bool = False
     data_retention_days: int = Field(default=365, ge=1, le=3650)
+    autonomy_level: str | None = Field(default=None, pattern=AUTONOMY_PATTERN)  # null: AICO_DEFAULT_AUTONOMY_LEVEL
+
+
+class ClientUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    contact_email: EmailStr | None = None
+    allow_external_llm: bool | None = None
+    data_retention_days: int | None = Field(default=None, ge=1, le=3650)
+    autonomy_level: str | None = Field(default=None, pattern=AUTONOMY_PATTERN)
 
 
 class ClientOut(ORM):
@@ -58,6 +116,7 @@ class ClientOut(ORM):
     contact_email: str | None
     allow_external_llm: bool
     data_retention_days: int
+    autonomy_level: str
     created_at: datetime
 
 
@@ -70,6 +129,21 @@ class DepartmentOut(ORM):
     name: str
     description: str
     sort_order: int
+    added_in_app: bool = False
+
+
+class DepartmentCreate(BaseModel):
+    """A custom department (not in the catalog). Give it a head agent so it can receive work."""
+
+    key: str = Field(pattern="^[a-z][a-z0-9_]{1,63}$")
+    name: str = Field(min_length=2, max_length=200)
+    description: str = Field(default="", max_length=2000)
+
+
+class DepartmentEnable(BaseModel):
+    """Switch on a catalog department with its whole team."""
+
+    key: str = Field(min_length=1, max_length=64)
 
 
 class AgentOut(ORM):
@@ -99,6 +173,7 @@ class AgentOut(ORM):
     customized: bool
     version: int
     updated_at: datetime
+    client_id: uuid.UUID | None = None  # set for an agent a client company created
 
 
 class AgentStats(BaseModel):
@@ -140,20 +215,43 @@ class AgentUpdate(BaseModel):
 
 
 class AgentCreate(BaseModel):
-    key: str = Field(pattern="^[a-z0-9_]{2,100}$")
-    name: str = Field(min_length=1, max_length=200)
+    key: str | None = Field(default=None, pattern="^[a-z0-9_]{2,100}$")  # null: derived from the name
+    name: str = Field(min_length=2, max_length=200)
     department_key: str
     role_type: str = Field(pattern="^(director|coordinator|sub_coordinator|specialist)$")
     reports_to_key: str
-    description: str = ""
-    responsibilities: list[str] = []
-    system_instructions: str = ""
-    output_requirements: str = ""
+    description: str = Field(default="", max_length=2000)
+    responsibilities: list[str] = Field(default=[], max_length=20)
+    system_instructions: str = Field(default="", max_length=20_000)
+    output_requirements: str = Field(default="", max_length=5000)
     allowed_tools: list[str] = []
-    task_kinds: list[str] = ["execute"]
+    task_kinds: list[str] | None = None  # null: the role's defaults
     model_tier: str = Field(default="standard", pattern="^(fast|standard|strong)$")
-    quality_criteria: list[str] = []
-    escalation_rules: list[str] = []
+    quality_criteria: list[str] = Field(default=[], max_length=20)
+    escalation_rules: list[str] = Field(default=[], max_length=20)
+
+
+class CompanyAgentCreate(BaseModel):
+    """An agent a client company creates for its own projects: a specialist in one department."""
+
+    name: str = Field(min_length=2, max_length=200)
+    department_key: str
+    description: str = Field(min_length=10, max_length=2000)
+    responsibilities: list[str] = Field(default=[], max_length=10)
+    system_instructions: str = Field(min_length=20, max_length=20_000)
+    allowed_tools: list[str] = []
+    model_tier: str = Field(default="standard", pattern="^(fast|standard|strong)$")
+    client_id: uuid.UUID | None = None  # staff only: the company the agent belongs to
+
+
+class CompanyAgentUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=200)
+    description: str | None = Field(default=None, min_length=10, max_length=2000)
+    responsibilities: list[str] | None = Field(default=None, max_length=10)
+    system_instructions: str | None = Field(default=None, min_length=20, max_length=20_000)
+    allowed_tools: list[str] | None = None
+    model_tier: str | None = Field(default=None, pattern="^(fast|standard|strong)$")
+    is_active: bool | None = None
 
 
 # ---------------------------------------------------------------- projects & tasks

@@ -2,25 +2,43 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { API_URL, api, getToken } from "./api";
+import { API_URL, ApiError, api, getToken } from "./api";
 import type { AuditEvent } from "./types";
 
-/** Fetch JSON from the API, optionally refreshing on an interval. */
+/**
+ * Fetch JSON from the API, optionally refreshing on an interval.
+ *
+ * A failed refresh keeps the last good `data` and sets `error`, so pages can show stale data with a
+ * warning instead of going blank. Polling pauses while the tab is hidden and catches up when it is
+ * shown again. Responses for a path the caller has since moved away from are ignored.
+ */
 export function useApi<T>(path: string | null, refreshMs?: number) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [errorStatus, setErrorStatus] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
+  const currentPath = useRef(path);
+  currentPath.current = path;
 
   const load = useCallback(async () => {
     if (!path) return;
+    setRefreshing(true);
     try {
       const result = await api<T>(path);
+      if (currentPath.current !== path) return;
       setData(result);
       setError(null);
+      setErrorStatus(null);
+      setUpdatedAt(Date.now());
     } catch (e) {
+      if (currentPath.current !== path) return;
       setError(e instanceof Error ? e.message : String(e));
+      setErrorStatus(e instanceof ApiError ? e.status : null);
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   }, [path]);
 
@@ -28,11 +46,17 @@ export function useApi<T>(path: string | null, refreshMs?: number) {
     setLoading(true);
     void load();
     if (!refreshMs) return;
-    const timer = setInterval(() => void load(), refreshMs);
-    return () => clearInterval(timer);
+    const visible = () => document.visibilityState === "visible";
+    const timer = setInterval(() => visible() && void load(), refreshMs);
+    const onVisibility = () => visible() && void load();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [load, refreshMs]);
 
-  return { data, error, loading, reload: load, setData };
+  return { data, error, errorStatus, loading, refreshing, updatedAt, reload: load, setData };
 }
 
 /**
